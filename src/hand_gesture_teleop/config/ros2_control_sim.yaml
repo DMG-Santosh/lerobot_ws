@@ -1,0 +1,84 @@
+# ros2_control_sim.yaml
+# =====================
+# ROS 2 Control controller configuration for the SO-101 mock simulation.
+#
+# ISOLATION:
+#   Used exclusively with mock_components/GenericSystem hardware plugin.
+#   No physical hardware, no serial port, no servo torque.
+#
+# CONTROLLER NAMES AND JOINTS:
+#   Intentionally identical to lerobot_moveit/config/ros2_control.yaml so
+#   that downstream teleop nodes can use the same action/topic endpoints
+#   in both simulation and physical modes.
+#
+# CONTROLLER MANAGER:
+#   update_rate: 50 Hz for smoother incremental teleoperation commands.
+#   (Physical launch uses 10 Hz; simulation has no communication latency.)
+#
+# NOTE: goal_time and stopped_velocity_tolerance are deliberately loose to
+# permit incremental streaming of small position steps from the teleop node.
+
+controller_manager:
+  ros__parameters:
+    update_rate: 50  # Hz — simulation update rate (higher than physical 10 Hz)
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    gripper_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+
+arm_controller:
+  ros__parameters:
+    joints:
+      - "joint1"
+      - "joint2"
+      - "joint3"
+      - "joint4"
+      - "joint5"
+
+    command_interfaces:
+      - position
+
+    state_interfaces:
+      - position
+
+    # Allow non-zero velocity at end of segment during incremental streaming
+    allow_nonzero_velocity_at_trajectory_end: true
+
+    # Allow position integration when only position points are provided
+    allow_integration_in_goal_trajectories: true
+
+    constraints:
+      goal_time: 10.0
+      stopped_velocity_tolerance: 100.0
+      joint1: { goal: 0.2 }
+      joint2: { goal: 0.2 }
+      joint3: { goal: 0.2 }
+      joint4: { goal: 0.2 }
+      joint5: { goal: 0.2 }
+
+
+gripper_controller:
+  ros__parameters:
+    joints:
+      - "joint6"
+
+    command_interfaces:
+      - position
+
+    state_interfaces:
+      - position
+      - velocity
+
+    allow_nonzero_velocity_at_trajectory_end: true
+    allow_integration_in_goal_trajectories: true
+
+    constraints:
+      goal_time: 10.0
+      stopped_velocity_tolerance: 100.0
+      joint6: { goal: 0.2 }

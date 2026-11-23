@@ -1,0 +1,42 @@
+# ROS 2 generated files
+/build/
+/install/
+/log/
+
+# Python virtual environments
+.venv/
+.venv*/
+.venv_hand_gesture/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Temporary files
+*.log
+*.tmp
+*.swp
+*~
+
+# ROS runtime data
+.ros/
+rosbag2_*/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Old MoveIt ZIP backup (using extracted package instead)
+src/lerobot_moveit.zip
+
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Local VS Code settings
+.vscode/
