@@ -457,23 +457,4 @@ The test script reports the number of tests executed and whether they passed. Ru
 - Software cancellation/disarming is not an emergency stop and must never be treated as one for a physical robot.
 - Do not connect, power, or command a physical SO-ARM 100/101 using this simulation-only procedure.
 
-## Updating the repository
 
-After changing source files or this README, review the changes and push them to the configured GitHub remote:
-
-```bash
-cd ~/lerobot_ws
-git status
-git add README.md
-git commit -m "Document hand gesture teleoperation project"
-git push
-```
-
-For future changes, stage the relevant files rather than generated folders such as `build/`, `install/`, `log/` or `.venv_hand_gesture/`.
-
----
-
-**Project:** SO-ARM 101 Hand Gesture Teleoperation
-**Middleware:** ROS 2 Jazzy
-**Vision:** OpenCV + MediaPipe Hand Landmarker
-**Simulation:** ROS 2 Control mock hardware + MoveIt 2 + RViz 2
