@@ -49,9 +49,11 @@ Safety Architecture (Task 5C-3A & 5C-3A-H):
 from dataclasses import dataclass
 import math
 import os
+import subprocess
 import sys
+import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -65,22 +67,27 @@ from mediapipe.tasks.python.vision import RunningMode
 # ROS 2 Python API
 import rclpy
 from rclpy.action import ActionClient
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration, Time as MsgTime
 from controller_manager_msgs.srv import ListHardwareComponents
 from control_msgs.action import FollowJointTrajectory
-from control_msgs.msg import JointTolerance
+from control_msgs.msg import JointTolerance, JointTrajectoryControllerState
 from geometry_msgs.msg import PoseStamped
 from lifecycle_msgs.msg import State as LifecycleState
 from moveit_msgs.msg import MoveItErrorCodes, PositionIKRequest, RobotState
-from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.srv import GetPositionIK, GetStateValidity
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-# Reusable Hand Tracking Logic
+# Reusable Hand Tracking Logic & SO-101 Kinematics
+from hand_gesture_teleop.so101_kinematics import (
+    SO101Kinematics,
+    unwrap_joint_delta,
+)
 from hand_gesture_teleop.hand_tracking import (
     GESTURE_CONFIG,
     MAPPING_CONFIG,
@@ -148,6 +155,22 @@ MAX_COMMANDED_VELOCITY: float = 0.20      # Max velocity for trajectory duration
 MIN_TRAJECTORY_DURATION: float = 0.50     # Minimum duration for commanded trajectory point (s)
 MAX_JOINT_STATE_AGE: float = 0.25         # Max acceptable age of /joint_states feedback (s)
 ARMING_TIMEOUT_SEC: float = 3.0           # Timeout for two-key arming handshake (s)
+
+# Task 5C-3D-REALTIME Continuous Control Constants
+CONTINUOUS_IK_PERIOD: float = 0.05        # 20 Hz IK query rate for continuous mode (s)
+CONTINUOUS_TRAJECTORY_DURATION: float = 0.10  # Trajectory point duration for continuous streaming (s)
+CONTINUOUS_MAX_JOINT_DELTA: float = 0.015  # Bounded per-step joint delta (0.20 rad/s * 0.05s = 0.010 <= MAX_JOINT_DELTA 0.10)
+CONTINUOUS_MAX_VELOCITY: float = 0.20     # Safe baseline per-joint velocity limit for continuous mode (rad/s)
+CONTINUOUS_WATCHDOG_TIMEOUT: float = 0.30 # Stop if no fresh hand input within this time (s)
+CONTINUOUS_MAX_ACCEL: float = 2.5                 # Bounded per-joint acceleration limit (rad/s^2)
+CONTINUOUS_MAX_CARTESIAN_SPEED: float = 0.04      # Smooth position-follower slew rate in continuous mode (40 mm/s)
+CONTINUOUS_MAX_TARGET_LEAD: float = 0.020         # Anti-windup target lead clamp from current FK EE (20 mm)
+CONTINUOUS_POS_FEEDBACK_GAIN: float = 5.0         # Closed-loop Cartesian tracking gain (1/s)
+CONTINUOUS_DLS_DAMPING: float = 0.015             # Singularity-damped DLS baseline damping lambda
+CONTINUOUS_WORKSPACE_SPAN: float = 0.05           # +/- 50 mm initial anchor-relative position span around E pose
+CONTINUOUS_MAX_TRACKING_ERROR: float = 0.18       # Max allowed /arm_controller tracking error before fault disarm (rad)
+CONTINUOUS_VALIDITY_CHECK_PERIOD: float = 0.10    # 10 Hz MoveIt /check_state_validity collision checks (s)
+CONTINUOUS_LOOKAHEAD_TAIL: float = 0.10           # Smooth deceleration horizon tail if ticks pause (s)
 
 # Task 5C-3A-F No-Op Suppression & IK Target Binding Constants
 MIN_IK_TARGET_DISPLACEMENT: float = 0.001   # Min Cartesian displacement to trigger new IK query (1 mm)
@@ -342,6 +365,146 @@ def build_trajectory_goal(
     return goal, duration_sec
 
 
+def _seconds_to_duration(seconds: float) -> Duration:
+    """Convert non-negative finite float seconds into a ROS Duration message."""
+    if not math.isfinite(seconds) or seconds < 0.0:
+        raise ValueError(f"Duration seconds must be non-negative and finite, got {seconds}")
+    sec = int(seconds)
+    nanosec = int(round((seconds - sec) * 1e9))
+    if nanosec >= 1_000_000_000:
+        sec += 1
+        nanosec -= 1_000_000_000
+    return Duration(sec=sec, nanosec=nanosec)
+
+
+def build_continuous_trajectory_msg(
+    curr_positions: Sequence[float],
+    curr_velocities: Sequence[float],
+    next_positions: Sequence[float],
+    next_velocities: Sequence[float],
+    step_dt: float = CONTINUOUS_IK_PERIOD,
+    lookahead_tail: float = CONTINUOUS_LOOKAHEAD_TAIL,
+    max_joint_delta: float = CONTINUOUS_MAX_JOINT_DELTA,
+    max_joint_vel: float = CONTINUOUS_MAX_VELOCITY,
+) -> JointTrajectory:
+    """
+    Construct a C^1-continuous 3-point receding-horizon JointTrajectory message
+    targeting strictly the 5 arm joints (joint6 excluded) for /arm_controller/joint_trajectory:
+      - Point 0 (t = 0.0):       (curr_positions, curr_velocities)
+      - Point 1 (t = step_dt):   (next_positions, next_velocities)
+      - Point 2 (t = step_dt + lookahead_tail): smooth rest deceleration tail if stream pauses
+
+    Header stamp is zero (sec=0, nanosec=0) for ROS 2 Jazzy "start now" splicing semantics.
+    """
+    n = len(ARM_CONTROL_JOINTS)
+    if (
+        len(curr_positions) != n
+        or len(curr_velocities) != n
+        or len(next_positions) != n
+        or len(next_velocities) != n
+    ):
+        raise ValueError(f"Expected {n} arm joints across trajectory inputs.")
+    if step_dt <= 0.0 or lookahead_tail <= 0.0:
+        raise ValueError("step_dt and lookahead_tail must be strictly positive.")
+
+    delta_cap = min(float(max_joint_delta), float(MAX_JOINT_DELTA))
+    tail_positions: List[float] = []
+
+    for idx, jname in enumerate(ARM_CONTROL_JOINTS):
+        c_pos = float(curr_positions[idx])
+        c_vel = float(curr_velocities[idx])
+        n_pos = float(next_positions[idx])
+        n_vel = float(next_velocities[idx])
+
+        for label, val in (
+            ("curr_pos", c_pos),
+            ("curr_vel", c_vel),
+            ("next_pos", n_pos),
+            ("next_vel", n_vel),
+        ):
+            if not math.isfinite(val):
+                raise ValueError(f"Non-finite {label} for {jname}: {val}")
+
+        lo, hi = ARM_JOINT_LIMITS[jname]
+        if c_pos < lo or c_pos > hi or n_pos < lo or n_pos > hi:
+            raise ValueError(f"Joint {jname} violates ARM_JOINT_LIMITS [{lo}, {hi}]")
+
+        dq = abs(unwrap_joint_delta(n_pos, c_pos))
+        if dq > delta_cap + 1e-6:
+            raise ValueError(
+                f"Continuous joint step for {jname} ({dq:.4f} rad) exceeds {delta_cap:.4f} rad"
+            )
+        if abs(c_vel) > max_joint_vel + 1e-6 or abs(n_vel) > max_joint_vel + 1e-6:
+            raise ValueError(f"Velocity for {jname} exceeds {max_joint_vel:.3f} rad/s")
+
+        # Average velocity 0.5 * n_vel decelerating to rest over lookahead_tail
+        t_pos = n_pos + 0.5 * n_vel * float(lookahead_tail)
+        t_pos = float(np.clip(t_pos, lo, hi))
+        if abs(t_pos - c_pos) > MAX_JOINT_DELTA:
+            t_pos = float(np.clip(c_pos + math.copysign(MAX_JOINT_DELTA, t_pos - c_pos), lo, hi))
+        tail_positions.append(t_pos)
+
+    msg = JointTrajectory()
+    msg.header.stamp = MsgTime(sec=0, nanosec=0)
+    msg.joint_names = list(ARM_CONTROL_JOINTS)
+
+    p0 = JointTrajectoryPoint()
+    p0.positions = [float(v) for v in curr_positions]
+    p0.velocities = [float(v) for v in curr_velocities]
+    p0.time_from_start = _seconds_to_duration(0.0)
+
+    p1 = JointTrajectoryPoint()
+    p1.positions = [float(v) for v in next_positions]
+    p1.velocities = [float(v) for v in next_velocities]
+    p1.time_from_start = _seconds_to_duration(float(step_dt))
+
+    p2 = JointTrajectoryPoint()
+    p2.positions = tail_positions
+    p2.velocities = [0.0] * n
+    p2.time_from_start = _seconds_to_duration(float(step_dt) + float(lookahead_tail))
+
+    msg.points = [p0, p1, p2]
+    return msg
+
+
+def build_continuous_hold_trajectory_msg(
+    hold_positions: Sequence[float],
+    hold_duration: float = CONTINUOUS_TRAJECTORY_DURATION,
+) -> JointTrajectory:
+    """
+    Construct an immediate zero-velocity hold trajectory for the 5 arm joints
+    to safely overwrite any active topic trajectory on disarm/watchdog stop.
+    """
+    n = len(ARM_CONTROL_JOINTS)
+    if len(hold_positions) != n:
+        raise ValueError(f"Expected {n} hold joint positions, got {len(hold_positions)}")
+
+    clipped_pos: List[float] = []
+    for idx, jname in enumerate(ARM_CONTROL_JOINTS):
+        val = float(hold_positions[idx])
+        if not math.isfinite(val):
+            raise ValueError(f"Non-finite hold position for {jname}: {val}")
+        lo, hi = ARM_JOINT_LIMITS[jname]
+        clipped_pos.append(float(np.clip(val, lo, hi)))
+
+    msg = JointTrajectory()
+    msg.header.stamp = MsgTime(sec=0, nanosec=0)
+    msg.joint_names = list(ARM_CONTROL_JOINTS)
+
+    p0 = JointTrajectoryPoint()
+    p0.positions = list(clipped_pos)
+    p0.velocities = [0.0] * n
+    p0.time_from_start = _seconds_to_duration(0.0)
+
+    p1 = JointTrajectoryPoint()
+    p1.positions = list(clipped_pos)
+    p1.velocities = [0.0] * n
+    p1.time_from_start = _seconds_to_duration(max(0.05, float(hold_duration)))
+
+    msg.points = [p0, p1]
+    return msg
+
+
 def compute_cubic_peak_velocity(delta_position: float, duration: float) -> float:
     """
     Calculate peak velocity for a rest-to-rest cubic spline trajectory:
@@ -486,6 +649,7 @@ class CartesianTargetConfig:
     CUMULATIVE_LIMIT_X: float = 0.050          # +/- 50 mm along X from initial pose
     CUMULATIVE_LIMIT_Y: float = 0.050          # +/- 50 mm along Y from initial pose
     CUMULATIVE_LIMIT_Z: float = 0.050          # +/- 50 mm along Z from initial pose
+    ENABLE_VERTICAL_Z: bool = False            # Disabled by default in 4-direction planar control mode
     MIN_HEIGHT_Z: float = 0.050                # Minimum height above base (50 mm)
     WORKSPACE_BOUNDS_X: Tuple[float, float] = (-0.25, 0.25)
     WORKSPACE_BOUNDS_Y: Tuple[float, float] = (-0.40, -0.10)
@@ -515,30 +679,33 @@ def compute_cartesian_increment(
     Computes conservative Cartesian increments (dx, dy, dz) in meters from normalized hand displacement.
 
     Mapping:
-      - X (lateral):  dx = step_scale * ux  (Right > 0, Left < 0)
-      - Y (reach):    dy = step_scale * uz  (Farther/into-scene uz < 0 -> robot reaches forward along -Y;
-                                             Closer/pull-back uz > 0 -> robot retracts along +Y)
-      - Z (vertical): dz = step_scale * uy  (Up > 0, Down < 0)
+      - X (lateral):  dx = step_scale * ux   (Right > 0 -> +X, Left < 0 -> -X)
+      - Y (reach):    dy = step_scale * (-uz) (TOWARD webcam uz > 0 -> robot extends forward along -Y;
+                                               AWAY from webcam uz < 0 -> robot retracts backward along +Y)
+      - Z (vertical): dz = step_scale * uy when cfg.ENABLE_VERTICAL_Z is True, else 0.0.
 
     Safety gating:
-      - Increments are (0, 0, 0) if hand_detected is False.
-      - Increments are (0, 0, 0) if gesture_state not in ("GRIPPER_OPEN", "GRIPPER_CLOSED").
-      - Increments are (0, 0, 0) if is_active is False.
+      - Increments are (0, 0, 0) if hand_detected is False or is_active is False.
+      - Arm translational tracking is decoupled from gripper classification (UNKNOWN does not gate motion).
       - Step scale: min(MAX_CARTESIAN_SPEED * dt, MAX_CARTESIAN_STEP).
       - Each axis increment is clamped to [-MAX_CARTESIAN_STEP, MAX_CARTESIAN_STEP].
     """
     if not hand_detected or not is_active:
         return 0.0, 0.0, 0.0
 
-    if gesture_state not in ("GRIPPER_OPEN", "GRIPPER_CLOSED"):
+    if not (math.isfinite(ux) and math.isfinite(uy) and math.isfinite(uz)):
         return 0.0, 0.0, 0.0
 
     clamped_dt = max(0.001, min(dt, 0.100))
     step_scale = min(cfg.MAX_CARTESIAN_SPEED * clamped_dt, cfg.MAX_CARTESIAN_STEP)
 
     dx = float(np.clip(step_scale * float(ux), -cfg.MAX_CARTESIAN_STEP, cfg.MAX_CARTESIAN_STEP))
-    dy = float(np.clip(step_scale * float(uz), -cfg.MAX_CARTESIAN_STEP, cfg.MAX_CARTESIAN_STEP))
-    dz = float(np.clip(step_scale * float(uy), -cfg.MAX_CARTESIAN_STEP, cfg.MAX_CARTESIAN_STEP))
+    dy = float(np.clip(step_scale * (-float(uz)), -cfg.MAX_CARTESIAN_STEP, cfg.MAX_CARTESIAN_STEP))
+    dz = (
+        float(np.clip(step_scale * float(uy), -cfg.MAX_CARTESIAN_STEP, cfg.MAX_CARTESIAN_STEP))
+        if cfg.ENABLE_VERTICAL_Z
+        else 0.0
+    )
 
     return dx, dy, dz
 
@@ -588,6 +755,13 @@ class HandTeleopNode(Node):
         self.declare_parameter("enable_ik_dry_run", False)
         self.declare_parameter("single_goal_test_mode", False)
         self.declare_parameter("max_goals_per_session", 0)
+        self.declare_parameter("continuous_arm_control", True)
+        self.declare_parameter("enable_collision_checking", True)
+        self.declare_parameter("continuous_cartesian_speed", CONTINUOUS_MAX_CARTESIAN_SPEED)
+        self.declare_parameter("continuous_position_span", CONTINUOUS_WORKSPACE_SPAN)
+        self.declare_parameter("continuous_max_joint_velocity", CONTINUOUS_MAX_VELOCITY)
+        self.declare_parameter("enable_vertical_z", False)
+        self.declare_parameter("camera_prefer_fixed_fps", False)
         self.declare_parameter("camera_index", 0)
         self.declare_parameter("frame_width", 640)
         self.declare_parameter("frame_height", 480)
@@ -668,8 +842,10 @@ class HandTeleopNode(Node):
         self._last_submitted_ik_target: Optional[Tuple[float, float, float]] = None
         self._last_submitted_ik_generation: int = 0
 
-        # ── MoveIt IK Client ───────────────────────────────────────────────
+        # ── MoveIt IK Client & SO-101 Continuous Kinematics ────────────────
         self.ik_client = self.create_client(GetPositionIK, "/compute_ik")
+        self.state_validity_client = self.create_client(GetStateValidity, "/check_state_validity")
+        self.kinematics = SO101Kinematics()
         self._ik_pending: bool = False
         self._last_ik_time: float = 0.0
         self._ik_call_count: int = 0
@@ -677,6 +853,39 @@ class HandTeleopNode(Node):
         self._ik_last_status: str = "DISABLED" if not self.enable_ik_dry_run else "IDLE"
         self._ik_last_error_code: int = 0
         self._latest_ik_solution: Optional[Dict[str, float]] = None
+
+        # ── Continuous Streaming Publisher, Controller State & Watchdogs ───
+        # Fail-closed: /arm_controller/joint_trajectory publisher is ONLY created when
+        # both enable_motion and enable_arm_motion are explicitly True (and continuous mode active).
+        self.arm_trajectory_pub: Optional[Any] = None
+        if self.enable_motion and self.enable_arm_motion and self.is_continuous_mode_configured:
+            self.arm_trajectory_pub = self.create_publisher(
+                JointTrajectory,
+                "/arm_controller/joint_trajectory",
+                10,
+            )
+        self._continuous_lock = threading.RLock()
+        self._continuous_ref_q: Optional[List[float]] = None
+        self._continuous_ref_qdot: List[float] = [0.0] * len(self._arm_control_joints)
+        self._continuous_anchor_target: Optional[Tuple[float, float, float]] = None
+        self._continuous_input_ux: float = 0.0
+        self._continuous_input_uy: float = 0.0
+        self._continuous_input_uz: float = 0.0
+        self._continuous_input_hand_detected: bool = False
+        self._continuous_input_gesture: str = "UNKNOWN"
+        self._continuous_last_input_time: Optional[float] = None
+        self._continuous_last_tick_time: Optional[float] = None
+        self._continuous_hold_published: bool = False
+        self._continuous_publish_count: int = 0
+        self._continuous_last_cond: float = 0.0
+        self._continuous_last_status: str = "IDLE"
+        self._last_controller_state_time: Optional[float] = None
+        self._controller_tracking_errors: Dict[str, float] = {}
+        self._max_tracking_error: float = 0.0
+        self._collision_free: bool = True
+        self._collision_check_pending: bool = False
+        self._last_collision_check_time: float = 0.0
+        self._last_collision_checked_q: Optional[Tuple[float, ...]] = None
 
         # ── Hand Tracking & Smoothing Setup ────────────────────────────────
         self.gesture_cfg: GestureConfig = GESTURE_CONFIG
@@ -696,12 +905,22 @@ class HandTeleopNode(Node):
         )
         self.motion_tracker = MotionPreviewTracker(cfg=self.mapping_cfg)
 
-        # ── ROS Subscriptions ──────────────────────────────────────────────
+        # ── ROS Subscriptions & Continuous Control Timer ───────────────────
         self.joint_state_sub = self.create_subscription(
             JointState,
             "/joint_states",
             self._joint_state_callback,
             10,
+        )
+        self.arm_controller_state_sub = self.create_subscription(
+            JointTrajectoryControllerState,
+            "/arm_controller/controller_state",
+            self._arm_controller_state_callback,
+            10,
+        )
+        self.continuous_control_timer = self.create_timer(
+            CONTINUOUS_IK_PERIOD,
+            self._continuous_control_tick,
         )
 
         # ── Dynamic Parameter Validation & Change Callbacks ────────────────
@@ -774,6 +993,68 @@ class HandTeleopNode(Node):
         return int(self.get_parameter("max_goals_per_session").value)
 
     @property
+    def continuous_arm_control(self) -> bool:
+        """Read the continuous_arm_control ROS parameter (default True)."""
+        return bool(self.get_parameter("continuous_arm_control").value)
+
+    @property
+    def enable_collision_checking(self) -> bool:
+        """Read the enable_collision_checking ROS parameter (default True)."""
+        return bool(self.get_parameter("enable_collision_checking").value)
+
+    @property
+    def continuous_cartesian_speed(self) -> float:
+        """Read the continuous_cartesian_speed ROS parameter (m/s)."""
+        return float(self.get_parameter("continuous_cartesian_speed").value)
+
+    @property
+    def continuous_position_span(self) -> float:
+        """Read the anchor-relative continuous workspace span ROS parameter (m)."""
+        return float(self.get_parameter("continuous_position_span").value)
+
+    @property
+    def continuous_max_joint_velocity(self) -> float:
+        """Read the continuous joint velocity limit ROS parameter (rad/s)."""
+        return float(self.get_parameter("continuous_max_joint_velocity").value)
+
+    @property
+    def enable_vertical_z(self) -> bool:
+        """Read whether robot vertical Z movement is enabled (default False for 4-dir mode)."""
+        return bool(self.get_parameter("enable_vertical_z").value)
+
+    @property
+    def camera_prefer_fixed_fps(self) -> bool:
+        """Read whether UVC exposure_dynamic_framerate=0 should be attempted for 30 FPS capture."""
+        return bool(self.get_parameter("camera_prefer_fixed_fps").value)
+
+    @property
+    def is_continuous_mode_configured(self) -> bool:
+        """
+        True when continuous differential-IK streaming should be used instead of
+        bounded/single-goal discrete action mode.
+        """
+        return bool(
+            self.continuous_arm_control
+            and not self.single_goal_test_mode
+            and self.max_goals_per_session == 0
+            and not self.enable_ik_dry_run
+        )
+
+    def is_continuous_streaming_active(self) -> bool:
+        """
+        True when armed with continuous streaming mode active and both enable_motion
+        and enable_arm_motion enabled without conflict.
+        """
+        return bool(
+            self.is_continuous_mode_configured
+            and self.enable_motion
+            and self.enable_arm_motion
+            and not self.modes_conflict
+            and self._teleop_state == STATE_ARMED
+            and not self._goal_active
+        )
+
+    @property
     def effective_session_goal_limit(self) -> int:
         """
         Calculates the effective trajectory goal dispatch attempt limit for an arming session.
@@ -803,29 +1084,13 @@ class HandTeleopNode(Node):
         return self._session_goal_dispatch_count >= eff_limit
 
     def get_control_state_text(self) -> str:
-        """Return the formatted control state text for HUD and telemetry."""
-        if not self.enable_motion:
-            return "DISARMED"
-        if self._teleop_state == STATE_ARMED:
-            eff_limit = self.effective_session_goal_limit
-            if eff_limit > 0:
-                limit_lbl = "Single-Goal" if self.single_goal_test_mode else "Session"
-                return f"ARMED [{limit_lbl} {self._session_goal_dispatch_count}/{eff_limit}]"
-            return "ARMED"
-        elif self._teleop_state == STATE_ARMING_PENDING:
-            now = time.monotonic()
-            rem = max(0.0, ARMING_TIMEOUT_SEC - (now - self._arming_requested_time))
-            return f"ARMING PENDING ({rem:.1f}s) - PRESS [Y]"
-        else:  # STATE_DISARMED
-            if self._cancel_requested_on_disarm:
-                return "DISARMED (CANCEL REQUESTED)"
-            if self._last_enable_error:
-                return f"DISARMED ({self._last_enable_error})"
-            eff_limit = self.effective_session_goal_limit
-            if eff_limit > 0:
-                limit_lbl = "Single-Goal" if self.single_goal_test_mode else "Session"
-                return f"DISARMED [{limit_lbl} {self._session_goal_dispatch_count}/{eff_limit}]"
-            return "DISARMED"
+        """
+        Return the formatted control state text for HUD: strictly 'ENABLED' or 'DISABLED'.
+        (Task 5C-3D-HUD-STRUCTURE-STATUS-CLEANUP Part B).
+        """
+        if self.enable_motion and self._teleop_state == STATE_ARMED:
+            return "ENABLED"
+        return "DISABLED"
 
     def get_anchor_state_text(self) -> str:
         """Return the neutral motion anchor status text."""
@@ -932,12 +1197,60 @@ class HandTeleopNode(Node):
         Rejects negative values for max_goals_per_session and out-of-limit gripper positions.
         """
         for param in params:
-            if param.name == "enable_arm_motion":
+            if param.name in (
+                "enable_arm_motion",
+                "continuous_arm_control",
+                "enable_collision_checking",
+                "enable_vertical_z",
+                "camera_prefer_fixed_fps",
+            ):
                 if param.value is not None and type(param.value) is not bool:
                     return SetParametersResult(
                         successful=False,
-                        reason="enable_arm_motion must be a boolean."
+                        reason=f"{param.name} must be a boolean."
                     )
+            elif param.name == "continuous_cartesian_speed":
+                if param.value is not None:
+                    try:
+                        val = float(param.value)
+                        if not math.isfinite(val) or val <= 0.0 or val > 0.15:
+                            return SetParametersResult(
+                                successful=False,
+                                reason="continuous_cartesian_speed must be in (0.0, 0.15] m/s."
+                            )
+                    except (TypeError, ValueError):
+                        return SetParametersResult(
+                            successful=False,
+                            reason="continuous_cartesian_speed must be a valid float."
+                        )
+            elif param.name == "continuous_position_span":
+                if param.value is not None:
+                    try:
+                        val = float(param.value)
+                        if not math.isfinite(val) or val < 0.005 or val > 0.12:
+                            return SetParametersResult(
+                                successful=False,
+                                reason="continuous_position_span must be in [0.005, 0.12] m."
+                            )
+                    except (TypeError, ValueError):
+                        return SetParametersResult(
+                            successful=False,
+                            reason="continuous_position_span must be a valid float."
+                        )
+            elif param.name == "continuous_max_joint_velocity":
+                if param.value is not None:
+                    try:
+                        val = float(param.value)
+                        if not math.isfinite(val) or val < 0.02 or val > 0.50:
+                            return SetParametersResult(
+                                successful=False,
+                                reason="continuous_max_joint_velocity must be in [0.02, 0.50] rad/s."
+                            )
+                    except (TypeError, ValueError):
+                        return SetParametersResult(
+                            successful=False,
+                            reason="continuous_max_joint_velocity must be a valid float."
+                        )
             elif param.name == "max_goals_per_session":
                 if param.value is not None and param.value < 0:
                     return SetParametersResult(
@@ -1002,21 +1315,45 @@ class HandTeleopNode(Node):
                     self.disarm("MODE_CONFLICT")
                 elif not self.enable_motion and self._teleop_state in (STATE_ARMED, STATE_ARMING_PENDING):
                     self.disarm("MOTION_DISABLED")
+                if not self.enable_motion or self.enable_ik_dry_run or self.modes_conflict:
+                    self._destroy_arm_trajectory_publisher()
+                elif self.enable_motion and self.enable_arm_motion and self.is_continuous_mode_configured:
+                    self._ensure_arm_trajectory_publisher()
             elif param.name == "enable_arm_motion":
                 if not self.enable_arm_motion:
                     self._pending_ik_candidate = None
                     self._pending_ik_snapshot = None
+                    self._stop_continuous_streaming("ARM_MOTION_DISABLED")
+                    self._destroy_arm_trajectory_publisher()
                     if self._goal_active:
                         self.get_logger().warn(
                             "enable_arm_motion changed to False while arm goal is active; "
                             "in-flight goal continues to completion on controller, new arm goals locked out."
                         )
+                elif self.enable_motion and self.is_continuous_mode_configured:
+                    self._ensure_arm_trajectory_publisher()
+            elif param.name == "continuous_arm_control":
+                if not self.continuous_arm_control:
+                    self._stop_continuous_streaming("CONTINUOUS_MODE_DISABLED")
+                    self._destroy_arm_trajectory_publisher()
+                elif self.enable_motion and self.enable_arm_motion and self.is_continuous_mode_configured:
+                    self._ensure_arm_trajectory_publisher()
             elif param.name == "single_goal_test_mode":
+                if self.single_goal_test_mode:
+                    self._stop_continuous_streaming("SINGLE_GOAL_MODE_ENABLED")
+                    self._destroy_arm_trajectory_publisher()
+                elif self.enable_motion and self.enable_arm_motion and self.is_continuous_mode_configured:
+                    self._ensure_arm_trajectory_publisher()
                 if self.single_goal_test_mode and self._session_goal_dispatch_count >= 1 and self._teleop_state == STATE_ARMED:
                     self._pending_ik_candidate = None
                     self._pending_ik_snapshot = None
                     self.disarm("SINGLE_GOAL_LIMIT_EXCEEDED")
             elif param.name == "max_goals_per_session":
+                if not self.is_continuous_mode_configured:
+                    self._stop_continuous_streaming("BOUNDED_QUOTA_CONFIGURED")
+                    self._destroy_arm_trajectory_publisher()
+                elif self.enable_motion and self.enable_arm_motion:
+                    self._ensure_arm_trajectory_publisher()
                 if self.is_session_goal_limit_reached() and self._teleop_state == STATE_ARMED:
                     self._pending_ik_candidate = None
                     self._pending_ik_snapshot = None
@@ -1043,6 +1380,23 @@ class HandTeleopNode(Node):
             if name in self._expected_joints and len(msg.velocity) > i:
                 new_velocities[name] = float(msg.velocity[i])
         self._latest_joint_velocities = new_velocities
+
+    def _arm_controller_state_callback(self, msg: JointTrajectoryControllerState) -> None:
+        """Track actual arm_controller tracking error from /arm_controller/controller_state."""
+        now = time.monotonic()
+        self._last_controller_state_time = now
+        errors: Dict[str, float] = {}
+        max_err = 0.0
+        err_positions = getattr(getattr(msg, "error", None), "positions", [])
+        for i, name in enumerate(getattr(msg, "joint_names", [])):
+            if name in self._arm_control_joints and i < len(err_positions):
+                val = abs(float(err_positions[i]))
+                if math.isfinite(val):
+                    errors[name] = val
+                    if val > max_err:
+                        max_err = val
+        self._controller_tracking_errors = errors
+        self._max_tracking_error = max_err
 
     def get_joint_state_diagnostics(self) -> Dict[str, Any]:
         """Return diagnostic dictionary of joint state telemetry."""
@@ -1109,6 +1463,489 @@ class HandTeleopNode(Node):
         self._target_z = self._initial_target[2]
         self._target_generation += 1
         self._last_submitted_ik_target = None
+
+    def _get_current_arm_joint_vector(self) -> Optional[List[float]]:
+        """Return ordered 5-element [joint1..joint5] vector if all are present and finite."""
+        if not all(j in self._latest_joint_positions for j in self._arm_control_joints):
+            return None
+        q = [float(self._latest_joint_positions[j]) for j in self._arm_control_joints]
+        if not all(math.isfinite(v) for v in q):
+            return None
+        return q
+
+    def sync_target_to_current_pose(self, use_exact_initial_when_zero: bool = True) -> bool:
+        """
+        Synchronize target Cartesian pose and continuous reference trajectory state
+        with actual forward kinematics of current /joint_states.
+        Prevents initial joint jumps when enabling teleoperation after prior motion.
+        """
+        with self._continuous_lock:
+            q_curr = self._get_current_arm_joint_vector()
+            if q_curr is None:
+                self.reset_target_pose()
+                return False
+
+            if use_exact_initial_when_zero and max(abs(v) for v in q_curr) < 1e-4:
+                self.reset_target_pose()
+                self._continuous_ref_q = list(q_curr)
+                self._continuous_ref_qdot = [0.0] * len(self._arm_control_joints)
+                self._continuous_anchor_target = self._initial_target
+                return True
+
+            pos_fk, _ = self.kinematics.forward_kinematics(q_curr)
+            self._target_x = float(pos_fk[0])
+            self._target_y = float(pos_fk[1])
+            self._target_z = float(pos_fk[2])
+            self._target_generation += 1
+            self._last_submitted_ik_target = None
+            self._continuous_ref_q = list(q_curr)
+            self._continuous_ref_qdot = [0.0] * len(self._arm_control_joints)
+            self._continuous_anchor_target = (self._target_x, self._target_y, self._target_z)
+            return True
+
+    @staticmethod
+    def _validate_landmarks(landmarks: Optional[Any], min_scale: float = 0.02) -> Tuple[bool, float]:
+        """Validate 21 finite in-bounds landmarks and non-degenerate 2D palm scale."""
+        if landmarks is None or len(landmarks) < 21:
+            return False, 0.0
+        for idx in range(21):
+            lm = landmarks[idx]
+            if not (math.isfinite(lm.x) and math.isfinite(lm.y)):
+                return False, 0.0
+            if not (-0.1 <= lm.x <= 1.1 and -0.1 <= lm.y <= 1.1):
+                return False, 0.0
+        palm_scale = float(dist_2d(landmarks[0], landmarks[9]))
+        if not math.isfinite(palm_scale) or palm_scale < min_scale:
+            return False, palm_scale if math.isfinite(palm_scale) else 0.0
+        return True, palm_scale
+
+    def recalibrate_anchor(
+        self,
+        landmarks: Optional[Any],
+        timestamp: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        """Manually recalibrate neutral hand anchor ('C') preserving current target (zero jump)."""
+        valid, scale_2d = self._validate_landmarks(landmarks, min_scale=0.02)
+        if not valid:
+            return False, "INVALID_LANDMARKS"
+        lm9 = landmarks[9]
+        if not self.motion_tracker.calibrate(lm9.x, lm9.y, scale_2d, timestamp=timestamp):
+            return False, "ANCHOR_CAPTURE_FAILED"
+        with self._continuous_lock:
+            self._continuous_input_ux = 0.0
+            self._continuous_input_uy = 0.0
+            self._continuous_input_uz = 0.0
+            if timestamp is not None:
+                self._continuous_last_input_time = float(timestamp)
+            self._continuous_anchor_target = (self._target_x, self._target_y, self._target_z)
+        return True, "RECALIBRATED"
+
+    def update_continuous_hand_input(
+        self,
+        preview: Optional[MotionPreviewData],
+        hand_detected: bool,
+        gesture_state: str,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """
+        Store latest valid hand motion input for the 20 Hz continuous control loop.
+        Decoupled from gripper gesture classification so transient UNKNOWN states
+        never interrupt continuous translational tracking when valid fresh landmarks exist.
+        """
+        now = time.monotonic() if timestamp is None else float(timestamp)
+        with self._continuous_lock:
+            self._continuous_input_hand_detected = bool(hand_detected)
+            self._continuous_input_gesture = str(gesture_state)
+            self._continuous_last_input_time = now
+            finite_inputs = (
+                preview is not None
+                and math.isfinite(preview.ux)
+                and math.isfinite(preview.uy)
+                and math.isfinite(preview.uz)
+            )
+            if (
+                hand_detected
+                and finite_inputs
+                and preview.is_calibrated
+            ):
+                self._continuous_input_ux = float(np.clip(preview.ux, -1.0, 1.0))
+                self._continuous_input_uy = float(np.clip(preview.uy, -1.0, 1.0))
+                self._continuous_input_uz = float(np.clip(preview.uz, -1.0, 1.0))
+            else:
+                self._continuous_input_ux = 0.0
+                self._continuous_input_uy = 0.0
+                self._continuous_input_uz = 0.0
+
+    def _ensure_arm_trajectory_publisher(self) -> Optional[Any]:
+        """Lazily create /arm_controller/joint_trajectory publisher only when arm motion is enabled."""
+        if not (self.enable_motion and self.enable_arm_motion and self.is_continuous_mode_configured):
+            return None
+        if self.arm_trajectory_pub is None:
+            self.arm_trajectory_pub = self.create_publisher(
+                JointTrajectory,
+                "/arm_controller/joint_trajectory",
+                10,
+            )
+        return self.arm_trajectory_pub
+
+    def _destroy_arm_trajectory_publisher(self) -> None:
+        """Destroy continuous arm trajectory publisher when arm motion or continuous mode is disabled."""
+        pub = getattr(self, "arm_trajectory_pub", None)
+        if pub is not None:
+            try:
+                self.destroy_publisher(pub)
+            except Exception:
+                pass
+            self.arm_trajectory_pub = None
+
+    def _publish_hold_at_current_or_ref(self) -> bool:
+        """Publish a zero-velocity hold trajectory on /arm_controller/joint_trajectory."""
+        if self.arm_trajectory_pub is None:
+            return False
+        q_hold = self._get_current_arm_joint_vector()
+        if q_hold is None:
+            q_hold = self._continuous_ref_q
+        if q_hold is None:
+            return False
+        try:
+            hold_msg = build_continuous_hold_trajectory_msg(q_hold)
+            self.arm_trajectory_pub.publish(hold_msg)
+            self._continuous_hold_published = True
+            self._continuous_ref_q = [float(v) for v in hold_msg.points[0].positions]
+            self._continuous_ref_qdot = [0.0] * len(self._arm_control_joints)
+            return True
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to publish continuous hold trajectory: {exc}")
+            return False
+
+    def _stop_continuous_streaming(self, reason: str = "STOPPED") -> bool:
+        """
+        Immediately halt continuous arm command outputs, zero buffered velocity/input,
+        and publish a zero-velocity hold trajectory if continuous commands were active.
+        Returns True if continuous streaming had been active and a hold was published.
+        """
+        with self._continuous_lock:
+            had_streaming = (
+                self._continuous_publish_count > 0
+                and not self._continuous_hold_published
+                and self._continuous_ref_q is not None
+            )
+            self._continuous_input_ux = 0.0
+            self._continuous_input_uy = 0.0
+            self._continuous_input_uz = 0.0
+            self._continuous_input_hand_detected = False
+            self._continuous_input_gesture = "UNKNOWN"
+            self._continuous_last_input_time = None
+            self._continuous_last_tick_time = None
+            self._continuous_ref_qdot = [0.0] * len(self._arm_control_joints)
+
+            published_hold = False
+            if had_streaming:
+                published_hold = self._publish_hold_at_current_or_ref()
+                self._trajectory_last_status = f"HOLD_{reason}"
+            self._continuous_last_status = reason
+            return had_streaming or published_hold
+
+    def _request_collision_check_async(self, q_candidate: Sequence[float]) -> None:
+        """Query MoveIt /check_state_validity asynchronously for a candidate arm pose."""
+        if self._collision_check_pending or not self.enable_collision_checking:
+            return
+        if not self.state_validity_client.service_is_ready():
+            return
+
+        req = GetStateValidity.Request()
+        req.group_name = self.target_cfg.IK_PLANNING_GROUP
+        rs = RobotState()
+        rs.joint_state = JointState()
+        rs.joint_state.header.stamp = self.get_clock().now().to_msg()
+        names = list(ARM_CONTROL_JOINTS)
+        positions = [float(v) for v in q_candidate]
+        if "joint6" in self._latest_joint_positions:
+            names.append("joint6")
+            positions.append(float(self._latest_joint_positions["joint6"]))
+        rs.joint_state.name = names
+        rs.joint_state.position = positions
+        req.robot_state = rs
+
+        self._collision_check_pending = True
+        self._last_collision_check_time = time.monotonic()
+        self._last_collision_checked_q = tuple(float(v) for v in q_candidate)
+        try:
+            future = self.state_validity_client.call_async(req)
+            future.add_done_callback(self._state_validity_response_callback)
+        except Exception:
+            self._collision_check_pending = False
+
+    def _state_validity_response_callback(self, future: Any) -> None:
+        """Handle /check_state_validity response for continuous collision guarding."""
+        self._collision_check_pending = False
+        try:
+            resp = future.result()
+            self._collision_free = bool(resp.valid)
+            if not self._collision_free:
+                self.get_logger().warn(
+                    "Continuous arm motion paused: MoveIt collision/validity check reported unsafe pose."
+                )
+        except Exception as exc:
+            self.get_logger().warn(f"State validity check exception: {exc}")
+
+    def _continuous_control_tick(self, dt_override: Optional[float] = None) -> bool:
+        """
+        20 Hz continuous closed-loop Cartesian control timer callback.
+        Computes continuity-aware 3x5 DLS differential IK along the active joint branch
+        and publishes C^1-continuous 3-point receding-horizon JointTrajectory messages to
+        /arm_controller/joint_trajectory without 3-goal quota limits.
+        """
+        with self._continuous_lock:
+            if not self.is_continuous_streaming_active():
+                return False
+
+            now = time.monotonic()
+
+            # 1. Verify mock hardware freshness
+            hw_ok, hw_reason = self.is_hardware_verified_and_fresh()
+            if not hw_ok:
+                self.disarm(f"HARDWARE_VERIFICATION_EXPIRED: {hw_reason}")
+                return False
+
+            # 2. Verify /joint_states feedback freshness and completeness
+            if not self._is_joint_state_fresh():
+                self.disarm("STALE_FEEDBACK")
+                return False
+
+            q_measured = self._get_current_arm_joint_vector()
+            if q_measured is None:
+                self.disarm("MISSING_JOINTS")
+                return False
+
+            # 3. Verify input stream freshness (stale hand-tracking watchdog)
+            if self._continuous_last_input_time is None:
+                return False
+            if (now - self._continuous_last_input_time) > CONTINUOUS_WATCHDOG_TIMEOUT:
+                if not self._continuous_hold_published:
+                    self._publish_hold_at_current_or_ref()
+                self._continuous_last_status = "INPUT_TIMEOUT_HOLD"
+                self._trajectory_last_status = "HOLD_INPUT_TIMEOUT"
+                return False
+
+            # 4. Verify controller tracking error from /arm_controller/controller_state
+            if (
+                self._last_controller_state_time is not None
+                and (now - self._last_controller_state_time) <= 0.5
+                and self._max_tracking_error > CONTINUOUS_MAX_TRACKING_ERROR
+            ):
+                self.disarm("TRACKING_ERROR_EXCEEDED")
+                return False
+
+            # 5. Verify internal reference has not diverged from actual measured /joint_states
+            if self._continuous_ref_q is not None:
+                ref_divergence = max(
+                    abs(unwrap_joint_delta(self._continuous_ref_q[i], q_measured[i]))
+                    for i in range(len(ARM_CONTROL_JOINTS))
+                )
+                if ref_divergence > CONTINUOUS_MAX_TRACKING_ERROR:
+                    self.disarm("TRACKING_DIVERGENCE")
+                    return False
+
+            # Initialize reference smoothly from measured joints if not yet set or resuming from rest
+            if self._continuous_ref_q is None or self._continuous_hold_published:
+                self._continuous_ref_q = list(q_measured)
+                self._continuous_ref_qdot = [0.0] * len(self._arm_control_joints)
+                p_fk, _ = self.kinematics.forward_kinematics(self._continuous_ref_q)
+                if self._continuous_anchor_target is None:
+                    self._continuous_anchor_target = p_fk
+                if self._continuous_hold_published:
+                    self._target_x, self._target_y, self._target_z = p_fk
+
+            # Compute tick dt
+            if dt_override is not None:
+                dt = max(0.01, min(float(dt_override), 0.10))
+            elif self._continuous_last_tick_time is None:
+                dt = CONTINUOUS_IK_PERIOD
+            else:
+                dt = max(0.01, min(now - self._continuous_last_tick_time, 0.10))
+            self._continuous_last_tick_time = now
+
+            # 6. Authoritative 4-direction anchor-relative position following (decoupled from gripper gesture):
+            #    Right (ux>0) -> +X | Left (ux<0) -> -X
+            #    Toward (uz>0) -> -Y (extend forward) | Away (uz<0) -> +Y (retract backward)
+            #    Vertical Z disabled unless enable_vertical_z=True (3x5 DLS holds Z at anchor_z)
+            hand_active = (
+                self._continuous_input_hand_detected
+                and self.motion_tracker.is_calibrated
+            )
+            speed = self.continuous_cartesian_speed
+            p_ee_actual, _ = self.kinematics.forward_kinematics(q_measured)
+            p_ee_ref, _ = self.kinematics.forward_kinematics(self._continuous_ref_q)
+            if self._continuous_anchor_target is None:
+                self._continuous_anchor_target = p_ee_ref
+            ax, ay, az = self._continuous_anchor_target
+
+            span = self.continuous_position_span
+            if hand_active:
+                desired_x = ax + span * self._continuous_input_ux
+                desired_y = ay - span * self._continuous_input_uz
+                desired_z = az + (span * self._continuous_input_uy if self.enable_vertical_z else 0.0)
+            else:
+                desired_x, desired_y, desired_z = self._target_x, self._target_y, self._target_z
+
+            desired_x, desired_y, desired_z = self.kinematics.clamp_target_to_reachable_workspace(
+                (desired_x, desired_y, desired_z),
+                min_height_z=self.target_cfg.MIN_HEIGHT_Z,
+            )
+
+            desired_dist_from_ref = math.sqrt(
+                (desired_x - p_ee_ref[0]) ** 2
+                + (desired_y - p_ee_ref[1]) ** 2
+                + (desired_z - p_ee_ref[2]) ** 2
+            )
+            ref_speed_now = max(abs(v) for v in self._continuous_ref_qdot)
+            if (self._continuous_hold_published or ref_speed_now < 0.01) and desired_dist_from_ref < 0.0005:
+                vx_ff, vy_ff, vz_ff = 0.0, 0.0, 0.0
+                cand_x, cand_y, cand_z = p_ee_ref
+            else:
+                err_x = desired_x - self._target_x
+                err_y = desired_y - self._target_y
+                err_z = desired_z - self._target_z
+                err_norm = math.sqrt(err_x * err_x + err_y * err_y + err_z * err_z)
+                max_step = speed * dt
+                if err_norm > max_step and err_norm > 1e-9:
+                    ratio = max_step / err_norm
+                    step_x, step_y, step_z = err_x * ratio, err_y * ratio, err_z * ratio
+                else:
+                    step_x, step_y, step_z = err_x, err_y, err_z
+
+                vx_ff = step_x / dt
+                vy_ff = step_y / dt
+                vz_ff = step_z / dt
+                cand_x = self._target_x + step_x
+                cand_y = self._target_y + step_y
+                cand_z = self._target_z + step_z
+
+            # Bound target relative to anchor target using configured span
+            cand_x = float(np.clip(cand_x, ax - span, ax + span))
+            cand_y = float(np.clip(cand_y, ay - span, ay + span))
+            cand_z = float(np.clip(cand_z, az - span, az + span))
+
+            # Anti-windup lead clamp relative to actual EE pose
+            lead_vec = np.array(
+                [cand_x - p_ee_actual[0], cand_y - p_ee_actual[1], cand_z - p_ee_actual[2]],
+                dtype=float,
+            )
+            lead_norm = float(np.linalg.norm(lead_vec))
+            if lead_norm > CONTINUOUS_MAX_TARGET_LEAD:
+                lead_vec = lead_vec * (CONTINUOUS_MAX_TARGET_LEAD / lead_norm)
+                cand_x = float(p_ee_actual[0] + lead_vec[0])
+                cand_y = float(p_ee_actual[1] + lead_vec[1])
+                cand_z = float(p_ee_actual[2] + lead_vec[2])
+
+            cand_x, cand_y, cand_z = self.kinematics.clamp_target_to_reachable_workspace(
+                (cand_x, cand_y, cand_z),
+                min_height_z=self.target_cfg.MIN_HEIGHT_Z,
+            )
+
+            # Check if arm has already settled calmly at target while hand is still
+            pos_err = math.sqrt(
+                (cand_x - p_ee_ref[0]) ** 2
+                + (cand_y - p_ee_ref[1]) ** 2
+                + (cand_z - p_ee_ref[2]) ** 2
+            )
+            ff_speed = math.sqrt(vx_ff * vx_ff + vy_ff * vy_ff + vz_ff * vz_ff)
+            ref_speed_peak = max(abs(v) for v in self._continuous_ref_qdot)
+            if ff_speed < 1e-4 and pos_err < 0.0005 and ref_speed_peak < 0.01:
+                self._target_x, self._target_y, self._target_z = p_ee_ref
+                if not self._continuous_hold_published and self._continuous_publish_count > 0:
+                    self._publish_hold_at_current_or_ref()
+                self._continuous_last_status = "SETTLED_HOLD"
+                self._trajectory_last_status = "HOLDING"
+                return False
+
+            # 7. Compute continuity-aware 3x5 DLS step
+            try:
+                ik_res = self.kinematics.solve_differential_step(
+                    q_curr=self._continuous_ref_q,
+                    target_xyz=(cand_x, cand_y, cand_z),
+                    v_ff_xyz=(vx_ff, vy_ff, vz_ff),
+                    dt=dt,
+                    prev_qdot=self._continuous_ref_qdot,
+                    pos_gain=CONTINUOUS_POS_FEEDBACK_GAIN,
+                    max_cartesian_speed=speed,
+                    damping_min=CONTINUOUS_DLS_DAMPING,
+                    max_joint_delta=min(CONTINUOUS_MAX_JOINT_DELTA, MAX_JOINT_DELTA),
+                    max_joint_vel=self.continuous_max_joint_velocity,
+                    max_joint_acc=CONTINUOUS_MAX_ACCEL,
+                )
+            except Exception as exc:
+                self._continuous_last_status = f"IK_ERROR_{exc}"
+                self.get_logger().warn(f"Continuous DLS solver error: {exc}")
+                return False
+
+            # 8. MoveIt /check_state_validity collision guard (probing lookahead candidate)
+            if self.enable_collision_checking:
+                if (now - self._last_collision_check_time) >= CONTINUOUS_VALIDITY_CHECK_PERIOD:
+                    self._request_collision_check_async(ik_res.q_next)
+                if not self._collision_free:
+                    self._target_x, self._target_y, self._target_z = p_ee_ref
+                    if not self._continuous_hold_published:
+                        self._publish_hold_at_current_or_ref()
+                    self._continuous_last_status = "COLLISION_BLOCKED"
+                    self._trajectory_last_status = "HOLD_COLLISION"
+                    return False
+
+            # Update target tracking state
+            if (abs(cand_x - self._target_x) + abs(cand_y - self._target_y) + abs(cand_z - self._target_z)) > 1e-6:
+                self._target_generation += 1
+            self._target_x, self._target_y, self._target_z = cand_x, cand_y, cand_z
+
+            # 9. Validate continuity relative to actual measured joints before publish
+            measured_max_delta = max(
+                abs(unwrap_joint_delta(ik_res.q_next[i], q_measured[i]))
+                for i in range(len(ARM_CONTROL_JOINTS))
+            )
+            if measured_max_delta > MAX_JOINT_DELTA:
+                self._continuous_last_status = "MEASURED_DELTA_CLAMPED"
+                self.get_logger().warn(
+                    f"Continuous step rejected vs measured state: {measured_max_delta:.4f} rad > {MAX_JOINT_DELTA:.4f} rad."
+                )
+                self._publish_hold_at_current_or_ref()
+                return False
+
+            # 10. Build C^1 receding-horizon JointTrajectory and publish on topic
+            try:
+                traj_msg = build_continuous_trajectory_msg(
+                    curr_positions=self._continuous_ref_q,
+                    curr_velocities=self._continuous_ref_qdot,
+                    next_positions=ik_res.q_next,
+                    next_velocities=ik_res.qdot_cmd,
+                    step_dt=dt,
+                    lookahead_tail=CONTINUOUS_LOOKAHEAD_TAIL,
+                )
+            except ValueError as exc:
+                self._continuous_last_status = f"TRAJ_INVALID_{exc}"
+                return False
+
+            # Final atomic gate check right before publishing
+            if not self.is_continuous_streaming_active():
+                return False
+            pub = self._ensure_arm_trajectory_publisher()
+            if pub is None:
+                return False
+
+            pub.publish(traj_msg)
+            self._continuous_ref_q = list(ik_res.q_next)
+            self._continuous_ref_qdot = list(ik_res.qdot_cmd)
+            self._continuous_hold_published = False
+            self._continuous_publish_count += 1
+            self._continuous_last_cond = ik_res.jacobian_cond
+            self._continuous_last_status = "STREAMING"
+            self._trajectory_last_status = "STREAMING"
+            self._ik_call_count += 1
+            self._ik_success_count += 1
+            self._ik_last_status = "CONTINUOUS_DLS_OK"
+            self._latest_ik_solution = {
+                j: float(ik_res.q_next[i]) for i, j in enumerate(self._arm_control_joints)
+            }
+            return True
 
     # ── Hardware Component Introspection & Freshness ───────────────────────
     def is_hardware_verified_and_fresh(self) -> Tuple[bool, str]:
@@ -1222,20 +2059,8 @@ class HandTeleopNode(Node):
             return False, "HAND_NOT_DETECTED"
 
         # Precondition 4: Landmark validity & palm scale check
-        coords_valid = True
-        for idx in range(min(len(landmarks), 21)):
-            lm = landmarks[idx]
-            if not (math.isfinite(lm.x) and math.isfinite(lm.y)):
-                coords_valid = False
-                break
-            if not (-0.1 <= lm.x <= 1.1 and -0.1 <= lm.y <= 1.1):
-                coords_valid = False
-                break
-
-        lm0 = landmarks[0]
-        lm9 = landmarks[9]
-        palm_scale_2d = dist_2d(lm0, lm9)
-        if not coords_valid or not math.isfinite(palm_scale_2d) or palm_scale_2d < 0.02:
+        coords_valid, palm_scale_2d = self._validate_landmarks(landmarks, min_scale=0.02)
+        if not coords_valid:
             self.disarm("INVALID_LANDMARKS")
             self._last_enable_error = "INVALID_LANDMARKS"
             self.get_logger().warn(
@@ -1243,13 +2068,9 @@ class HandTeleopNode(Node):
             )
             return False, "INVALID_LANDMARKS"
 
-        # Precondition 5: Hand stability check (gesture state and movement stability)
-        if gesture_state not in ("GRIPPER_OPEN", "GRIPPER_CLOSED"):
-            self.disarm("UNSTABLE_HAND")
-            self._last_enable_error = "UNSTABLE_HAND"
-            self.get_logger().warn(f"Teleoperation enable failed: Gesture state '{gesture_state}' is unstable.")
-            return False, "UNSTABLE_HAND"
+        lm9 = landmarks[9]
 
+        # Precondition 5: Spatial hand stability check (decoupled from transient UNKNOWN gripper state)
         if self._last_hand_landmarks is not None and len(self._last_hand_landmarks) >= 21:
             prev_lm9 = self._last_hand_landmarks[9]
             if math.isfinite(prev_lm9.x) and math.isfinite(prev_lm9.y):
@@ -1260,8 +2081,9 @@ class HandTeleopNode(Node):
                     self.get_logger().warn(f"Teleoperation enable failed: Hand moving too fast (drift={drift:.4f}).")
                     return False, "UNSTABLE_HAND"
 
-        # Precondition 6: Auto-capture neutral anchor
-        calib_ok = self.motion_tracker.calibrate(lm9.x, lm9.y, palm_scale_2d)
+        # Precondition 6: Auto-capture multi-frame neutral anchor
+        now = time.monotonic()
+        calib_ok = self.motion_tracker.calibrate(lm9.x, lm9.y, palm_scale_2d, timestamp=now)
         if not calib_ok or not self.motion_tracker.is_calibrated:
             self.disarm("ANCHOR_CAPTURE_FAILED")
             self._last_enable_error = "ANCHOR_CAPTURE_FAILED"
@@ -1269,7 +2091,6 @@ class HandTeleopNode(Node):
             return False, "ANCHOR_CAPTURE_FAILED"
 
         # Precondition 7: /joint_states feedback received, all 6 joints present, fresh (< 0.25s)
-        now = time.monotonic()
         if self._last_joint_state_time is None or (now - self._last_joint_state_time) > MAX_JOINT_STATE_AGE:
             self.disarm("STALE_OR_MISSING_FEEDBACK")
             self._last_enable_error = "STALE_OR_MISSING_FEEDBACK"
@@ -1331,17 +2152,35 @@ class HandTeleopNode(Node):
             return False, "INVALID_PARAMETER_VALUE"
 
         # All preconditions passed!
-        self._teleop_state = STATE_ARMED
-        self._last_submitted_ik_target = None
-        self._session_goal_dispatch_count = 0
-        self._last_enable_error = None
-        self._cancel_requested_on_disarm = False
-        self.reset_target_pose()
+        with self._continuous_lock:
+            if self.enable_arm_motion and self.is_continuous_mode_configured:
+                self._ensure_arm_trajectory_publisher()
+            self._teleop_state = STATE_ARMED
+            self._last_submitted_ik_target = None
+            self._session_goal_dispatch_count = 0
+            self._last_enable_error = None
+            self._cancel_requested_on_disarm = False
+            self._continuous_hold_published = False
+            self._collision_free = True
+            self._max_tracking_error = 0.0
+            self._continuous_last_tick_time = None
+            self.sync_target_to_current_pose(use_exact_initial_when_zero=True)
+            self._continuous_input_ux = 0.0
+            self._continuous_input_uy = 0.0
+            self._continuous_input_uz = 0.0
+            self._continuous_input_hand_detected = bool(hand_detected)
+            self._continuous_input_gesture = str(gesture_state)
+            self._continuous_last_input_time = time.monotonic()
 
         if self.enable_arm_motion:
+            mode_desc = (
+                "Continuous 3x5 DLS streaming enabled"
+                if self.is_continuous_mode_configured
+                else "Discrete trajectory action execution enabled"
+            )
             self.get_logger().info(
                 "*** TELEOPERATION ENABLED (AUTO-ANCHOR CAPTURED — SIMULATION ONLY) *** "
-                "Arm trajectory execution enabled."
+                f"Arm motion enabled ({mode_desc})."
             )
         else:
             self.get_logger().info(
@@ -1434,7 +2273,8 @@ class HandTeleopNode(Node):
         self._last_submitted_ik_target = None
         self._last_disarm_reason = reason
 
-        had_active_motion = bool(self._goal_active or self._gripper_goal_active)
+        was_continuous_streaming = self._stop_continuous_streaming(reason)
+        had_active_motion = bool(self._goal_active or self._gripper_goal_active or was_continuous_streaming)
 
         if self._goal_active:
             self._cancel_active_goal()
@@ -2218,6 +3058,14 @@ class HandTeleopNode(Node):
             "target_generation": self._target_generation,
             "last_submitted_ik_target": self._last_submitted_ik_target,
             "has_pending_candidate": (self._pending_ik_candidate is not None),
+            "continuous_arm_control": self.continuous_arm_control,
+            "continuous_mode_configured": self.is_continuous_mode_configured,
+            "continuous_streaming_active": self.is_continuous_streaming_active(),
+            "continuous_publish_count": self._continuous_publish_count,
+            "continuous_last_status": self._continuous_last_status,
+            "continuous_last_cond": self._continuous_last_cond,
+            "collision_free": self._collision_free,
+            "max_tracking_error": self._max_tracking_error,
         }
 
     # ── Diagnostic Overlay Rendering ───────────────────────────────────────
@@ -2490,7 +3338,11 @@ class HandTeleopNode(Node):
         self.get_logger().info(f"Using MediaPipe model: {model_path}")
 
         # 2. Build MediaPipe Hand Landmarker
-        latest_result: Dict[str, Any] = {"value": None}
+        latest_result: Dict[str, Any] = {
+            "value": None,
+            "callback_time": None,
+            "callback_count": 0,
+        }
 
         def _result_callback(
             result: mp_vision.HandLandmarkerResult,
@@ -2498,6 +3350,8 @@ class HandTeleopNode(Node):
             timestamp_ms: int,
         ) -> None:
             latest_result["value"] = result
+            latest_result["callback_time"] = time.monotonic()
+            latest_result["callback_count"] += 1
 
         options = mp_vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=model_path),
@@ -2515,12 +3369,40 @@ class HandTeleopNode(Node):
 
         # 3. Open webcam
         cam_idx = self.camera_index
-        cap = cv2.VideoCapture(cam_idx)
+        if self.camera_prefer_fixed_fps:
+            try:
+                subprocess.run(
+                    ["v4l2-ctl", "-d", f"/dev/video{cam_idx}", "--set-ctrl=exposure_dynamic_framerate=0"],
+                    check=False,
+                    timeout=1.0,
+                )
+            except Exception:
+                pass
+        def _open_camera_idx(idx: int):
+            v4l = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if v4l.isOpened():
+                return v4l
+            v4l.release()
+            return cv2.VideoCapture(idx)
+
+        cap = _open_camera_idx(cam_idx)
+        if not cap.isOpened():
+            # Graceful fallback: try alternate camera indices (0, 1, 2)
+            for alt_idx in [0, 1, 2]:
+                if alt_idx != cam_idx:
+                    alt_cap = _open_camera_idx(alt_idx)
+                    if alt_cap.isOpened():
+                        self.get_logger().info(f"Fallback to camera index {alt_idx} succeeded.")
+                        cap = alt_cap
+                        cam_idx = alt_idx
+                        break
         if not cap.isOpened():
             self.get_logger().error(f"Cannot open camera index {cam_idx}.")
             landmarker.close()
             return
 
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -2532,22 +3414,30 @@ class HandTeleopNode(Node):
         )
 
         fps = 0.0
+        mp_fps = 0.0
         frame_count = 0
+        last_mp_count = 0
         fps_window_frames = 30
         fps_timer = time.monotonic()
+        last_sent_ts_ms = -1
+        low_fps_warned = False
         last_frame_time = time.monotonic()
         last_hw_check_time = 0.0
+        last_snapshot_time = 0.0
 
         # Setup enlarged display window (~75% screen dimensions, preserving 4:3 aspect ratio)
         window_name = "Hand Gesture Teleop – ROS 2 Node (Simulation)"
         target_w, target_h = setup_enlarged_camera_window(window_name)
         self.get_logger().info(f"Display window configured: {target_w}x{target_h} (preserves 4:3 aspect ratio)")
 
+        # Start background executor thread for continuous, real-time ROS callback processing
+        executor = SingleThreadedExecutor()
+        executor.add_node(self)
+        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        spin_thread.start()
+
         try:
             while rclpy.ok():
-                # Service pending ROS events (non-blocking)
-                rclpy.spin_once(self, timeout_sec=0.001)
-
                 current_time = time.monotonic()
 
                 # Periodic hardware verification check (every 1 second)
@@ -2593,13 +3483,25 @@ class HandTeleopNode(Node):
                     continue
 
                 frame_count += 1
-                if frame_count % fps_window_frames == 0:
+                if frame_count % fps_window_frames == 0 or (current_time - fps_timer) >= 3.0:
                     elapsed = current_time - fps_timer
-                    fps = fps_window_frames / elapsed if elapsed > 0 else 0.0
-                    fps_timer = current_time
+                    if elapsed > 0.25:
+                        fps = frame_count / elapsed
+                        cb_cnt = latest_result["callback_count"]
+                        mp_fps = (cb_cnt - last_mp_count) / elapsed
+                        last_mp_count = cb_cnt
+                        frame_count = 0
+                        fps_timer = current_time
+                        if fps < 15.0 and not low_fps_warned:
+                            low_fps_warned = True
+                            self.get_logger().warn(
+                                f"Webcam running at {fps:.1f} FPS (MediaPipe {mp_fps:.1f} Hz); "
+                                "likely UVC low-light exposure_dynamic_framerate=1."
+                            )
 
-                # Send frame to MediaPipe
-                timestamp_ms = int(current_time * 1000)
+                # Send frame to MediaPipe with strictly monotonic millisecond timestamp
+                timestamp_ms = max(last_sent_ts_ms + 1, int(time.monotonic() * 1000))
+                last_sent_ts_ms = timestamp_ms
                 rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(
                     image_format=mp.ImageFormat.SRGB,
@@ -2608,7 +3510,15 @@ class HandTeleopNode(Node):
                 landmarker.detect_async(mp_image, timestamp_ms)
 
                 result = latest_result["value"]
-                hand_detected = result is not None and len(result.hand_landmarks) > 0
+                res_timestamp = latest_result["callback_time"]
+                raw_hand_detected = result is not None and len(result.hand_landmarks) > 0
+                raw_landmarks = result.hand_landmarks[0] if raw_hand_detected else None
+                landmarks_valid, _ = (
+                    self._validate_landmarks(raw_landmarks, min_scale=1e-4)
+                    if raw_hand_detected
+                    else (False, 0.0)
+                )
+                hand_detected = raw_hand_detected and landmarks_valid
 
                 # Automatic disarm on hand loss or stale feedback while ARMED
                 if self._teleop_state == STATE_ARMED:
@@ -2666,29 +3576,40 @@ class HandTeleopNode(Node):
                 preview_data = self.motion_tracker.update(
                     hand_detected=hand_detected,
                     landmarks=first_hand_landmarks,
+                    timestamp=res_timestamp,
                 )
 
                 # Compute frame delta time
                 dt = current_time - last_frame_time
                 last_frame_time = current_time
 
-                # Cartesian target accumulation
-                is_active = (self._teleop_state == STATE_ARMED) or self.enable_ik_dry_run
-                dx, dy, dz = compute_cartesian_increment(
-                    ux=preview_data.ux,
-                    uy=preview_data.uy,
-                    uz=preview_data.uz,
-                    dt=dt,
-                    hand_detected=hand_detected,
-                    gesture_state=confirmed_gesture,
-                    is_active=is_active,
-                    cfg=self.target_cfg,
-                )
-                self.update_cartesian_target(dx, dy, dz)
+                # Feed latest hand preview using true MediaPipe callback freshness
+                if res_timestamp is not None:
+                    self.update_continuous_hand_input(
+                        preview=preview_data,
+                        hand_detected=hand_detected,
+                        gesture_state=confirmed_gesture,
+                        timestamp=res_timestamp,
+                    )
 
-                # Trigger non-blocking IK query if permitted by current mode
-                if self.can_issue_ik_requests():
-                    self.request_ik()
+                if not self.is_continuous_streaming_active():
+                    # Discrete / dry-run / preview target accumulation path
+                    is_active = (self._teleop_state == STATE_ARMED) or self.enable_ik_dry_run
+                    dx, dy, dz = compute_cartesian_increment(
+                        ux=preview_data.ux,
+                        uy=preview_data.uy,
+                        uz=preview_data.uz,
+                        dt=dt,
+                        hand_detected=hand_detected,
+                        gesture_state=confirmed_gesture,
+                        is_active=is_active,
+                        cfg=self.target_cfg,
+                    )
+                    self.update_cartesian_target(dx, dy, dz)
+
+                    # Trigger non-blocking IK query if permitted by current mode
+                    if self.can_issue_ik_requests():
+                        self.request_ik()
 
                 # Gripper actuation (Task 5C-3D)
                 if hand_detected and confirmed_gesture in ("GRIPPER_OPEN", "GRIPPER_CLOSED"):
@@ -2707,7 +3628,7 @@ class HandTeleopNode(Node):
 
                 # 3. Determine Gripper state text
                 if not self.enable_motion:
-                    gripper_disp = "IDLE (Motion disabled)"
+                    gripper_disp = "IDLE"
                 elif self._gripper_goal_active:
                     gripper_disp = "PENDING"
                 elif self._last_commanded_gripper_state == "GRIPPER_OPEN":
@@ -2715,23 +3636,14 @@ class HandTeleopNode(Node):
                 elif self._last_commanded_gripper_state == "GRIPPER_CLOSED":
                     gripper_disp = "CLOSED"
                 elif self._gripper_last_status in ("ABORTED", "CANCELED", "REJECTED"):
-                    gripper_disp = f"ERROR ({self._gripper_last_status})"
+                    gripper_disp = "ERROR"
                 else:
                     gripper_disp = "IDLE"
 
-                # 4. Determine Control state text, Anchor status, and hotkey help
+                # 4. Determine Control state text, Anchor status, and heading (Part B & Part C)
                 control_disp = self.get_control_state_text()
                 anchor_disp = self.get_anchor_state_text()
-
-                if not self.enable_motion:
-                    help_line = "Hotkeys: [Q/Esc] Quit"
-                    heading_text = "PREVIEW ONLY — NO ROBOT COMMANDS"
-                elif self._teleop_state == STATE_ARMED:
-                    help_line = "Hotkeys: [D] Stop | [C] Recalibrate | [Q] Quit"
-                    heading_text = "HAND TELEOP — SIMULATION"
-                else:
-                    help_line = "Hotkeys: [E] Enable (Auto-Anchor) | [D] Stop | [Q] Quit"
-                    heading_text = "HAND TELEOP — SIMULATION"
+                heading_text = "HAND TELEOP — SIMULATION" if self.enable_motion else "PREVIEW ONLY — NO ROBOT COMMANDS"
 
                 # 5. Render single consolidated compact HUD in top-left corner
                 draw_compact_hud(
@@ -2741,12 +3653,21 @@ class HandTeleopNode(Node):
                     gripper_state_text=gripper_disp,
                     control_state_text=control_disp,
                     is_motion_enabled=self.enable_motion,
-                    help_text=help_line,
                     status_heading=heading_text,
                     anchor_state_text=anchor_disp,
                 )
 
                 cv2.imshow(window_name, display_frame)
+
+                if (current_time - last_snapshot_time) > 1.0:
+                    try:
+                        cv2.imwrite(
+                            "/home/santosh/.gemini/antigravity/brain/4c58e1db-7934-4399-888f-489094ba6837/live_hud_snapshot.png",
+                            display_frame,
+                        )
+                        last_snapshot_time = current_time
+                    except Exception:
+                        pass
 
                 # Key Handling
                 key = cv2.waitKey(1) & 0xFF
@@ -2771,27 +3692,44 @@ class HandTeleopNode(Node):
                     )
                 elif key in (ord("c"), ord("C")):
                     if hand_detected and first_hand_landmarks is not None:
-                        lm9 = first_hand_landmarks[9]
-                        lm0 = first_hand_landmarks[0]
-                        scale_2d = dist_2d(lm0, lm9)
-                        self.motion_tracker.calibrate(lm9.x, lm9.y, scale_2d)
-                        self.get_logger().info(
-                            f"Neutral anchor recalibrated: X0={lm9.x:.3f}, Y0={lm9.y:.3f}, Scale0={scale_2d:.3f}"
+                        rec_ok, rec_reason = self.recalibrate_anchor(
+                            first_hand_landmarks,
+                            timestamp=res_timestamp,
                         )
+                        if rec_ok:
+                            self.get_logger().info(
+                                f"Neutral anchor recalibrated: "
+                                f"X0={self.motion_tracker.anchor_x:.3f}, "
+                                f"Y0={self.motion_tracker.anchor_y:.3f}, "
+                                f"Scale0={self.motion_tracker.anchor_scale:.3f}"
+                            )
+                        else:
+                            self.get_logger().warn(f"Cannot recalibrate: {rec_reason}")
                     else:
                         self.get_logger().warn(
                             "Cannot recalibrate: No hand detected in frame."
                         )
                 elif key in (ord("r"), ord("R")):
                     self.motion_tracker.reset_calibration()
-                    self.reset_target_pose()
-                    self.get_logger().info("Calibration anchor and Cartesian target reset.")
+                    if self.is_continuous_streaming_active():
+                        self.sync_target_to_current_pose(use_exact_initial_when_zero=False)
+                        self._publish_hold_at_current_or_ref()
+                        self.get_logger().info("Calibration anchor reset; continuous arm target synchronized to current pose.")
+                    else:
+                        self.reset_target_pose()
+                        self.get_logger().info("Calibration anchor and Cartesian target reset.")
 
         finally:
+            self._stop_continuous_streaming("SHUTDOWN")
             if self._goal_active:
                 self._cancel_active_goal()
             if self._gripper_goal_active:
                 self._cancel_active_gripper_goal()
+            try:
+                executor.shutdown()
+                spin_thread.join(timeout=1.0)
+            except Exception:
+                pass
             cap.release()
             cv2.destroyAllWindows()
             landmarker.close()

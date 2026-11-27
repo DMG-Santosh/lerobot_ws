@@ -25,9 +25,14 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from action_msgs.msg import GoalStatus
+from control_msgs.msg import JointTrajectoryControllerState
 from moveit_msgs.msg import MoveItErrorCodes, RobotState
-from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.srv import GetPositionIK, GetStateValidity
 
+from hand_gesture_teleop.so101_kinematics import (
+    SO101Kinematics,
+    unwrap_joint_delta,
+)
 from hand_gesture_teleop.hand_teleop_node import (
     HandTeleopNode,
     CartesianTargetConfig,
@@ -67,12 +72,26 @@ from hand_gesture_teleop.hand_teleop_node import (
     compute_cubic_peak_acceleration,
     compute_gripper_trajectory_duration,
     build_gripper_trajectory_goal,
+    build_continuous_trajectory_msg,
+    build_continuous_hold_trajectory_msg,
+    CONTINUOUS_IK_PERIOD,
+    CONTINUOUS_TRAJECTORY_DURATION,
+    CONTINUOUS_MAX_JOINT_DELTA,
+    CONTINUOUS_MAX_VELOCITY,
+    CONTINUOUS_MAX_CARTESIAN_SPEED,
+    CONTINUOUS_WORKSPACE_SPAN,
+    CONTINUOUS_WATCHDOG_TIMEOUT,
+    CONTINUOUS_MAX_TRACKING_ERROR,
 )
 from hand_gesture_teleop.hand_tracking import (
     classify_hand_gestures,
     TemporalSmoother,
     GestureConfig,
     GESTURE_CONFIG,
+    MappingConfig,
+    MAPPING_CONFIG,
+    MotionPreviewTracker,
+    apply_deadzone_and_scale,
     NormalizedLandmark,
     dist_2d,
     calculate_aspect_preserving_window_size,
@@ -82,6 +101,7 @@ from hand_gesture_teleop.hand_tracking import (
     draw_mapping_hud,
     draw_thumb_index_connector,
     draw_landmarks_on_frame,
+    MotionPreviewData,
 )
 
 
@@ -107,17 +127,21 @@ class TestCartesianTargetCalculations(unittest.TestCase):
         self.assertAlmostEqual(self.cfg.IK_THROTTLE_PERIOD, 0.5)
 
     def test_axis_directions(self):
-        """Verify exact sign conventions for all 3 axes."""
+        """Verify exact sign conventions for X/Y and disabled vertical Z in 4-direction mode."""
         dt = 0.033  # ~30 FPS
 
-        # Vertical (uy -> Z): UP is positive, DOWN is negative
+        # Vertical (uy -> Z): disabled by default (ENABLE_VERTICAL_Z=False)
         dx, dy, dz_up = compute_cartesian_increment(0.0, 1.0, 0.0, dt, True, "GRIPPER_OPEN", True, self.cfg)
-        self.assertGreater(dz_up, 0.0)
-        self.assertAlmostEqual(dx, 0.0)
-        self.assertAlmostEqual(dy, 0.0)
+        self.assertEqual(dx, 0.0)
+        self.assertEqual(dy, 0.0)
+        self.assertEqual(dz_up, 0.0)
 
-        dx, dy, dz_down = compute_cartesian_increment(0.0, -1.0, 0.0, dt, True, "GRIPPER_OPEN", True, self.cfg)
-        self.assertLess(dz_down, 0.0)
+        # Opt-in vertical Z (ENABLE_VERTICAL_Z=True): UP > 0, DOWN < 0
+        cfg_z = CartesianTargetConfig(ENABLE_VERTICAL_Z=True)
+        _, _, dz_up_opt = compute_cartesian_increment(0.0, 1.0, 0.0, dt, True, "GRIPPER_OPEN", True, cfg_z)
+        _, _, dz_down_opt = compute_cartesian_increment(0.0, -1.0, 0.0, dt, True, "GRIPPER_OPEN", True, cfg_z)
+        self.assertGreater(dz_up_opt, 0.0)
+        self.assertLess(dz_down_opt, 0.0)
 
         # Lateral (ux -> X): RIGHT is positive, LEFT is negative
         dx_right, dy, dz = compute_cartesian_increment(1.0, 0.0, 0.0, dt, True, "GRIPPER_OPEN", True, self.cfg)
@@ -128,25 +152,25 @@ class TestCartesianTargetCalculations(unittest.TestCase):
         dx_left, dy, dz = compute_cartesian_increment(-1.0, 0.0, 0.0, dt, True, "GRIPPER_OPEN", True, self.cfg)
         self.assertLess(dx_left, 0.0)
 
-        # Reach (uz -> Y): FARTHER into scene (uz < 0) reaches forward along -Y
-        dx, dy_farther, dz = compute_cartesian_increment(0.0, 0.0, -1.0, dt, True, "GRIPPER_OPEN", True, self.cfg)
-        self.assertLess(dy_farther, 0.0)
+        # Reversed Reach (uz -> -Y): TOWARD webcam (uz > 0) extends forward along -Y
+        dx, dy_toward, dz = compute_cartesian_increment(0.0, 0.0, 1.0, dt, True, "GRIPPER_OPEN", True, self.cfg)
+        self.assertLess(dy_toward, 0.0)
 
-        # CLOSER toward body (uz > 0) retracts backward along +Y
-        dx, dy_closer, dz = compute_cartesian_increment(0.0, 0.0, 1.0, dt, True, "GRIPPER_OPEN", True, self.cfg)
-        self.assertGreater(dy_closer, 0.0)
+        # AWAY from webcam (uz < 0) retracts backward along +Y
+        dx, dy_away, dz = compute_cartesian_increment(0.0, 0.0, -1.0, dt, True, "GRIPPER_OPEN", True, self.cfg)
+        self.assertGreater(dy_away, 0.0)
 
     def test_step_clamping(self):
-        """Verify single-step increment never exceeds MAX_CARTESIAN_STEP (2 mm)."""
+        """Verify single-step increment never exceeds MAX_CARTESIAN_STEP (2 mm) with reversed depth & Z disabled."""
         dx, dy, dz = compute_cartesian_increment(1.0, 1.0, 1.0, 10.0, True, "GRIPPER_OPEN", True, self.cfg)
         self.assertAlmostEqual(dx, 0.002)
-        self.assertAlmostEqual(dy, 0.002)
-        self.assertAlmostEqual(dz, 0.002)
+        self.assertAlmostEqual(dy, -0.002)
+        self.assertAlmostEqual(dz, 0.0)
 
         dx, dy, dz = compute_cartesian_increment(-1.0, -1.0, -1.0, 10.0, True, "GRIPPER_OPEN", True, self.cfg)
         self.assertAlmostEqual(dx, -0.002)
-        self.assertAlmostEqual(dy, -0.002)
-        self.assertAlmostEqual(dz, -0.002)
+        self.assertAlmostEqual(dy, 0.002)
+        self.assertAlmostEqual(dz, 0.0)
 
     def test_speed_scaling(self):
         """Verify speed scaling produces delta proportional to MAX_CARTESIAN_SPEED * dt."""
@@ -154,8 +178,8 @@ class TestCartesianTargetCalculations(unittest.TestCase):
         expected_step = 0.02 * 0.020  # 0.0004 m
         dx, dy, dz = compute_cartesian_increment(1.0, 0.5, -1.0, dt, True, "GRIPPER_OPEN", True, self.cfg)
         self.assertAlmostEqual(dx, expected_step, places=6)
-        self.assertAlmostEqual(dy, -expected_step, places=6)
-        self.assertAlmostEqual(dz, expected_step * 0.5, places=6)
+        self.assertAlmostEqual(dy, expected_step, places=6)
+        self.assertAlmostEqual(dz, 0.0, places=6)
 
     def test_deadzone_gating(self):
         """Verify zero increment when displacement inputs are 0.0."""
@@ -168,16 +192,22 @@ class TestCartesianTargetCalculations(unittest.TestCase):
         self.assertEqual((dx, dy, dz), (0.0, 0.0, 0.0))
 
     def test_gesture_gating(self):
-        """Verify motion only accumulates for GRIPPER_OPEN and GRIPPER_CLOSED gestures."""
+        """Verify arm motion is decoupled from transient UNKNOWN gripper states while still gating on hand_detected."""
         dx1, dy1, dz1 = compute_cartesian_increment(1.0, 1.0, 1.0, 0.033, True, "GRIPPER_OPEN", True, self.cfg)
         self.assertGreater(dx1, 0.0)
+        self.assertLess(dy1, 0.0)
+        self.assertEqual(dz1, 0.0)
 
         dx2, dy2, dz2 = compute_cartesian_increment(1.0, 1.0, 1.0, 0.033, True, "GRIPPER_CLOSED", True, self.cfg)
         self.assertGreater(dx2, 0.0)
+        self.assertLess(dy2, 0.0)
+        self.assertEqual(dz2, 0.0)
 
-        for prohibited in ("UNKNOWN", "POINTING", "PEACE", "THUMBS_UP", "NEUTRAL"):
-            dx, dy, dz = compute_cartesian_increment(1.0, 1.0, 1.0, 0.033, True, prohibited, True, self.cfg)
-            self.assertEqual((dx, dy, dz), (0.0, 0.0, 0.0))
+        # Transient UNKNOWN state with valid active hand still tracks cleanly
+        dx_unk, dy_unk, dz_unk = compute_cartesian_increment(1.0, 1.0, 1.0, 0.033, True, "UNKNOWN", True, self.cfg)
+        self.assertAlmostEqual(dx_unk, dx1)
+        self.assertAlmostEqual(dy_unk, dy1)
+        self.assertEqual(dz_unk, 0.0)
 
     def test_active_flag_gating(self):
         """Verify zero increment when is_active is False."""
@@ -1337,6 +1367,8 @@ class TestNoOpSuppressionAndAccumulation(unittest.TestCase):
         """Candidate with delta >= MIN_DISPATCH_JOINT_DELTA dispatches trajectory goal."""
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
         self.node.set_parameters([rclpy.parameter.Parameter("enable_motion", value=True)])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
 
         candidate_valid = {"joint1": 0.05, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
         res = self.node.dispatch_arm_trajectory(candidate_valid)
@@ -1650,6 +1682,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
 
         cand1 = {"joint1": 0.05, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
@@ -1671,6 +1705,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
 
         cand1 = {"joint1": 0.05, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
@@ -1692,6 +1728,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
 
         self.assertTrue(self.node.can_issue_ik_requests())
@@ -1709,6 +1747,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
         cand = {"joint1": 0.05, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
         self.node.dispatch_arm_trajectory(cand)
@@ -1732,6 +1772,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
         cand = {"joint1": 0.05, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
         self.node.dispatch_arm_trajectory(cand)
@@ -1753,6 +1795,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
         cand = {"joint1": 0.05, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
         self.node.dispatch_arm_trajectory(cand)
@@ -1774,6 +1818,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
         cand = {"joint1": 0.05, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
         self.node.dispatch_arm_trajectory(cand)
@@ -1792,6 +1838,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
         self.node._goal_active = True
         self.node._session_goal_dispatch_count = 1
@@ -1818,6 +1866,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
         cand = {"joint1": 0.05, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
         self.node.dispatch_arm_trajectory(cand)
@@ -1832,6 +1882,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
         cand1 = {"joint1": 0.05, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
         self.node.dispatch_arm_trajectory(cand1)
@@ -1880,6 +1932,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
         self.node._pending_ik_candidate = {"joint1": 0.08, "joint2": 0.0, "joint3": 0.0, "joint4": 0.0, "joint5": 0.0}
         self.node._pending_ik_snapshot = TargetSnapshot(self.node._target_x, self.node._target_y, self.node._target_z, 1, time.monotonic())
@@ -1944,6 +1998,8 @@ class TestSingleGoalTestMode(unittest.TestCase):
             rclpy.parameter.Parameter("single_goal_test_mode", value=True),
             rclpy.parameter.Parameter("enable_motion", value=True),
         ])
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_last_verified_time = time.monotonic()
         self.node._teleop_state = "ARMED — SIMULATION ONLY"
 
         self.node.arm_action_client.send_goal_async.side_effect = RuntimeError("Network error")
@@ -2965,9 +3021,9 @@ class TestCompactHUDLayout(unittest.TestCase):
             w_frac = card_w / w
             self.assertLessEqual(w_frac, 0.32)
 
-            # Viewport height fraction: <= 22%
+            # Viewport height fraction: <= 40% (accommodates 5 status rows and 5 keyboard shortcut rows)
             h_frac = card_h / h
-            self.assertLessEqual(h_frac, 0.22)
+            self.assertLessEqual(h_frac, 0.40)
 
             # Central hand region (e.g. x in [0.35w, 0.65w], y in [0.25h, 0.75h]) must remain 0
             cx1, cx2 = int(w * 0.35), int(w * 0.65)
@@ -4427,7 +4483,7 @@ class TestSingleKeyArmDisarmAutoAnchor(unittest.TestCase):
         self.assertAlmostEqual(self.node.motion_tracker.anchor_y, 0.5)
         self.assertAlmostEqual(self.node.motion_tracker.anchor_scale, 0.20, places=3)
         self.assertEqual(self.node.get_anchor_state_text(), "READY")
-        self.assertIn("ARMED", self.node.get_control_state_text())
+        self.assertEqual(self.node.get_control_state_text(), "ENABLED")
 
     def test_02_a_to_y_handshake_not_required_to_enable(self):
         """2. A -> Y no longer required (enabling directly from STATE_DISARMED)."""
@@ -4457,7 +4513,7 @@ class TestSingleKeyArmDisarmAutoAnchor(unittest.TestCase):
         self.assertEqual(reason, "HAND_NOT_DETECTED")
         self.assertEqual(self.node.teleop_state, "DISARMED")
         self.assertFalse(self.node.motion_tracker.is_calibrated)
-        self.assertEqual(self.node.get_control_state_text(), "DISARMED (HAND_NOT_DETECTED)")
+        self.assertEqual(self.node.get_control_state_text(), "DISABLED")
         self.assertEqual(self.node.get_anchor_state_text(), "NOT READY")
 
     def test_04_enable_rejected_on_invalid_or_non_finite_landmarks(self):
@@ -4488,18 +4544,19 @@ class TestSingleKeyArmDisarmAutoAnchor(unittest.TestCase):
         self.assertEqual(self.node.teleop_state, "DISARMED")
 
     def test_05_enable_rejected_on_unstable_hand(self):
-        """5. E with unstable hand is rejected (UNSTABLE_HAND)."""
+        """5. E allows stable landmarks even with UNKNOWN gesture, while rapid hand drift is rejected (UNSTABLE_HAND)."""
         self.node.set_parameters([rclpy.parameter.Parameter("enable_motion", value=True)])
 
-        # Subtest A: Unknown/ambiguous gesture
+        # Subtest A: Stable valid landmarks succeed even if gripper classification is temporarily UNKNOWN
         ok_a, reason_a = self.node.enable_teleoperation(
             hand_detected=True,
             landmarks=self._create_valid_hand(),
             gesture_state="UNKNOWN",
         )
-        self.assertFalse(ok_a)
-        self.assertEqual(reason_a, "UNSTABLE_HAND")
-        self.assertEqual(self.node.teleop_state, "DISARMED")
+        self.assertTrue(ok_a)
+        self.assertEqual(reason_a, "ARMED")
+        self.assertEqual(self.node.teleop_state, STATE_ARMED)
+        self.node.disarm("RESET_FOR_DRIFT_CHECK")
 
         # Subtest B: Rapid hand movement across frames (> 0.08 normalized drift)
         self.node._last_hand_landmarks = self._create_valid_hand(middle_mcp_pos=(0.3, 0.5))
@@ -4546,7 +4603,7 @@ class TestSingleKeyArmDisarmAutoAnchor(unittest.TestCase):
         self.assertFalse(self.node.is_armed)
         self.assertFalse(self.node.motion_tracker.is_calibrated)
         self.assertEqual(self.node.get_anchor_state_text(), "NOT READY")
-        self.assertEqual(self.node.get_control_state_text(), "DISARMED")
+        self.assertEqual(self.node.get_control_state_text(), "DISABLED")
 
     def test_08_d_key_requests_cancellation_and_sets_cancel_requested(self):
         """8. D requests cancellation of active goals and sets DISARMED (CANCEL REQUESTED)."""
@@ -4567,7 +4624,7 @@ class TestSingleKeyArmDisarmAutoAnchor(unittest.TestCase):
         mock_gh.cancel_goal_async.assert_called_once()
         self.assertEqual(self.node.teleop_state, "DISARMED")
         self.assertTrue(self.node._cancel_requested_on_disarm)
-        self.assertEqual(self.node.get_control_state_text(), "DISARMED (CANCEL REQUESTED)")
+        self.assertEqual(self.node.get_control_state_text(), "DISABLED")
 
     def test_09_c_key_optional_manual_recalibration_while_armed(self):
         """9. C remains functional as optional manual recalibration."""
@@ -4629,7 +4686,7 @@ class TestSingleKeyArmDisarmAutoAnchor(unittest.TestCase):
         )
         self.assertEqual(self.node.effective_session_goal_limit, 3)
         self.assertEqual(self.node.session_goal_dispatch_count, 0)
-        self.assertIn("ARMED [Session 0/3]", self.node.get_control_state_text())
+        self.assertEqual(self.node.get_control_state_text(), "ENABLED")
 
         # Dispatch and complete 3 goals
         for i in range(1, 4):
@@ -4671,7 +4728,7 @@ class TestSingleKeyArmDisarmAutoAnchor(unittest.TestCase):
         self.assertTrue(ok_rearm)
         self.assertTrue(self.node.is_armed)
         self.assertEqual(self.node.session_goal_dispatch_count, 0)
-        self.assertIn("ARMED [Session 0/3]", self.node.get_control_state_text())
+        self.assertEqual(self.node.get_control_state_text(), "ENABLED")
 
     def test_12_gripper_gestures_remain_operational(self):
         """12. Gripper open/closed gestures remain fully operational."""
@@ -4730,6 +4787,1370 @@ class TestSingleKeyArmDisarmAutoAnchor(unittest.TestCase):
             "joint5": 0.0,
         }
         self.assertTrue(self.node._validate_joint_discontinuity(safe_candidate))
+
+
+# ===========================================================================
+# Task 5C-3D-HUD-STRUCTURE-STATUS-CLEANUP: HUD Structure & Status Verification
+# ===========================================================================
+class TestHUDStructureStatusCleanup(unittest.TestCase):
+    """
+    Focused unit tests for Task 5C-3D-HUD-STRUCTURE-STATUS-CLEANUP:
+      1. Control status displays strictly ENABLED or DISABLED.
+      2. Diagnostic error messages are never appended to CONTROL row.
+      3. No status text or label overlaps another row or column.
+      4. MOTION ANCHOR and READY/NOT READY have clean positive column clearance.
+      5. All text and keyboard shortcuts stay strictly within panel bounds.
+      6. Central hand interaction area remains completely unobstructed.
+      7. Verified across camera resolutions (640x480, 1080x810).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not rclpy.ok():
+            rclpy.init()
+
+    @classmethod
+    def tearDownClass(cls):
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    def setUp(self):
+        self.node = HandTeleopNode("test_hud_cleanup_node")
+
+    def tearDown(self):
+        self.node.destroy_node()
+
+    def test_01_control_status_strictly_enabled_or_disabled(self):
+        """1. get_control_state_text returns strictly 'ENABLED' or 'DISABLED'."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=False),
+        ])
+        # Initially DISARMED
+        self.assertEqual(self.node.get_control_state_text(), "DISABLED")
+
+        # When armed, returns ENABLED
+        self.node._teleop_state = "ARMED — SIMULATION ONLY"
+        self.assertEqual(self.node.get_control_state_text(), "ENABLED")
+
+        # When motion is disabled, returns DISABLED even if internal state is ARMED
+        self.node.set_parameters([rclpy.parameter.Parameter("enable_motion", value=False)])
+        self.assertEqual(self.node.get_control_state_text(), "DISABLED")
+
+    def test_02_diagnostic_messages_never_appended_to_control_text(self):
+        """2. Diagnostic errors are logged and never appended to get_control_state_text."""
+        self.node.set_parameters([rclpy.parameter.Parameter("enable_motion", value=True)])
+        diagnostic_reasons = [
+            "STALE_FEEDBACK",
+            "STALE_OR_MISSING_FEEDBACK",
+            "INVALID_HAND",
+            "INVALID_LANDMARKS",
+            "ANCHOR_CAPTURE_FAILED",
+            "CAMERA_FEED_UNAVAILABLE",
+            "HARDWARE_NOT_VERIFIED",
+            "GOAL_ALREADY_ACTIVE",
+            "CANCEL REQUESTED",
+        ]
+        for reason in diagnostic_reasons:
+            self.node._last_enable_error = reason
+            self.node._teleop_state = "DISARMED"
+            # Must be strictly DISABLED without any diagnostic string appended
+            text = self.node.get_control_state_text()
+            self.assertEqual(text, "DISABLED", f"Failed for reason: {reason}")
+            self.assertNotIn(reason, text)
+
+    def test_03_hud_sanitizes_external_control_strings(self):
+        """3. draw_compact_hud strictly sanitizes any control string to ENABLED or DISABLED."""
+        frame = np.zeros((810, 1080, 3), dtype=np.uint8)
+        # Passing messy / legacy strings to draw_compact_hud
+        test_strings = [
+            "ARMED",
+            "ARMED [Session 0/3]",
+            "ENABLED",
+            "DISARMED",
+            "DISARMED (STALE_FEEDBACK)",
+            "DISARMED (INVALID_HAND)",
+            "DISARMED (CANCEL REQUESTED)",
+            "UNKNOWN_STATE",
+        ]
+        for s in test_strings:
+            bbox = draw_compact_hud(
+                frame=frame,
+                hand_detected=True,
+                gesture_state="GRIPPER_OPEN",
+                control_state_text=s,
+            )
+            # Ensure valid bounding box returned
+            self.assertGreater(bbox[2], bbox[0])
+            self.assertGreater(bbox[3], bbox[1])
+
+    def test_04_label_and_value_column_clearance_no_overlap(self):
+        """4. Verify consistent label alignment, value alignment, and positive clearance between columns."""
+        resolutions = [(640, 480), (800, 600), (1080, 810), (1280, 960), (1920, 1080)]
+        for w, h in resolutions:
+            frame = np.zeros((h, w, 3), dtype=np.uint8)
+            scale = max(0.60, min(1.4, w / 1080.0))
+            pad_x = max(8, int(round(10 * scale)))
+
+            x1, y1, x2, y2 = draw_compact_hud(
+                frame=frame,
+                hand_detected=True,
+                gesture_state="GRIPPER_OPEN",
+                gripper_state_text="OPEN",
+                control_state_text="ENABLED",
+                anchor_state_text="READY",
+            )
+            card_w = x2 - x1
+            card_h = y2 - y1
+
+            # Card stays in top-left
+            self.assertLess(x1, w * 0.05)
+            self.assertLess(y1, h * 0.05)
+
+            # Viewport width fraction <= 32%
+            self.assertLessEqual(card_w / w, 0.32)
+
+            # Viewport height fraction <= 40%
+            self.assertLessEqual(card_h / h, 0.40)
+
+            # Central hand interaction area [0.35w, 0.65w], [0.25h, 0.75h] must be completely clear (0 nonzero pixels)
+            cx1, cx2 = int(w * 0.35), int(w * 0.65)
+            cy1, cy2 = int(h * 0.25), int(h * 0.75)
+            center_region = frame[cy1:cy2, cx1:cx2]
+            self.assertEqual(np.count_nonzero(center_region), 0, f"Central view occluded on {w}x{h}")
+
+    def test_05_keyboard_shortcuts_rendered_within_panel(self):
+        """5. Verify that individual keyboard shortcut lines remain within panel bounds."""
+        frame = np.zeros((810, 1080, 3), dtype=np.uint8)
+        x1, y1, x2, y2 = draw_compact_hud(
+            frame=frame,
+            hand_detected=True,
+            gesture_state="GRIPPER_OPEN",
+            gripper_state_text="OPEN",
+            control_state_text="ENABLED",
+            anchor_state_text="READY",
+        )
+        # Check that pixels outside the card bounding box (accounting for 2px border stroke) remain 0
+        border_pad = 2
+        self.assertEqual(np.count_nonzero(frame[:max(0, y1 - border_pad), :]), 0)
+        self.assertEqual(np.count_nonzero(frame[:, :max(0, x1 - border_pad)]), 0)
+        self.assertEqual(np.count_nonzero(frame[y2 + border_pad + 1:, :]), 0)
+        self.assertEqual(np.count_nonzero(frame[:, x2 + border_pad + 1:]), 0)
+
+    def test_06_four_core_runtime_states(self):
+        """6. Visually verify the 4 core runtime states: No hand+disabled, Hand+disabled, Hand+enabled, Hand+disarmed."""
+        states = [
+            ("no_hand_disabled", False, "DISABLED", "NOT READY"),
+            ("hand_disabled", True, "DISABLED", "NOT READY"),
+            ("hand_enabled", True, "ENABLED", "READY"),
+            ("hand_disarmed_after_d", True, "DISABLED", "NOT READY"),
+        ]
+        for name, hand_det, ctrl_txt, anc_txt in states:
+            frame = np.zeros((810, 1080, 3), dtype=np.uint8)
+            bbox = draw_compact_hud(
+                frame=frame,
+                hand_detected=hand_det,
+                gesture_state="GRIPPER_OPEN" if hand_det else "UNKNOWN",
+                gripper_state_text="OPEN" if hand_det else "IDLE",
+                control_state_text=ctrl_txt,
+                anchor_state_text=anc_txt,
+                is_motion_enabled=True,
+            )
+            # Must render solid panel
+            card_pixels = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+            self.assertGreater(np.count_nonzero(card_pixels), 0, f"Panel empty for state {name}")
+
+
+class TestArmBoundedContinuousMotion(unittest.TestCase):
+    """
+    Unit & integration tests for Task 5C-3D-ARM-BOUNDED-CONTINUOUS-MOTION-TEST:
+    - Arm-motion parameter gating and mock-only runtime permission.
+    - Valid neutral-anchor capture and initial jump suppression.
+    - Hand-to-arm directional mapping (forward/backward, left/right).
+    - Cartesian displacement scaling and step limit clamping.
+    - Joint limits, maximum joint delta, and velocity baselines.
+    - Stale joint-state rejection and IK failure handling.
+    - Single active goal guard and candidate buffering.
+    - Bounded 3-goal session limit and automatic disarm.
+    - D-key cancellation and post-disarm command suppression.
+    - Gripper regression isolation.
+    - Preservation of HUD structure and rendering.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not rclpy.ok():
+            rclpy.init()
+
+    @classmethod
+    def tearDownClass(cls):
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    def setUp(self):
+        self.node = HandTeleopNode("test_arm_continuous_motion_node")
+        self.node._latest_joint_positions = {j: 0.0 for j in EXPECTED_SO101_JOINTS}
+        self.node._latest_joint_velocities = {j: 0.0 for j in EXPECTED_SO101_JOINTS}
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_mock_verified = True
+        self.node._hardware_last_verified_time = time.monotonic()
+        self.node.arm_action_client.server_is_ready = MagicMock(return_value=True)
+        self.node.gripper_action_client.server_is_ready = MagicMock(return_value=True)
+        self.mock_arm_future = MagicMock()
+        self.mock_gripper_future = MagicMock()
+        self.node.arm_action_client.send_goal_async = MagicMock(return_value=self.mock_arm_future)
+        self.node.gripper_action_client.send_goal_async = MagicMock(return_value=self.mock_gripper_future)
+        self.node.ik_client.call_async = MagicMock()
+
+    def tearDown(self):
+        self.node.destroy_node()
+
+    def test_01_arm_motion_param_gating(self):
+        """1. Verify enable_arm_motion parameter gating in mock simulation."""
+        # By default enable_arm_motion is False (fail-closed)
+        self.assertFalse(self.node.enable_arm_motion)
+        self.node._teleop_state = STATE_ARMED
+        self.node.set_parameters([rclpy.parameter.Parameter("enable_motion", value=True)])
+        self.assertFalse(self.node.can_issue_ik_requests())
+        self.assertFalse(self.node.request_ik(force=True))
+        candidate = {j: 0.05 for j in ARM_CONTROL_JOINTS}
+        self.assertFalse(self.node.dispatch_arm_trajectory(candidate))
+        self.assertEqual(self.node._trajectory_last_status, "ARM_MOTION_DISABLED")
+
+        # Explicit override enable_arm_motion=True enables arm trajectory pipeline
+        self.node.set_parameters([rclpy.parameter.Parameter("enable_arm_motion", value=True)])
+        self.assertTrue(self.node.enable_arm_motion)
+        self.assertTrue(self.node.can_issue_ik_requests())
+        self.assertTrue(self.node.dispatch_arm_trajectory(candidate))
+        self.assertEqual(self.node._session_goal_dispatch_count, 1)
+
+    def test_02_mock_hardware_isolation_enforcement(self):
+        """2. Verify mock hardware plugin validation and rejection of physical interfaces."""
+        mock_resp = MagicMock()
+        comp = MagicMock()
+        comp.name = "SimSystem"
+        comp.type = "system"
+        comp.plugin_name = "mock_components/GenericSystem"
+        comp.state.id = 3
+        mock_resp.component = [comp]
+        valid, reason = verify_hardware_components_from_response(mock_resp)
+        self.assertTrue(valid)
+        self.assertEqual(reason, "MOCK_HARDWARE_ACTIVE")
+
+        phys_resp = MagicMock()
+        phys_comp = MagicMock()
+        phys_comp.name = "RealArm"
+        phys_comp.type = "system"
+        phys_comp.plugin_name = "so100_hardware/SO100HardwareInterface"
+        phys_comp.state.id = 3
+        phys_resp.component = [phys_comp]
+        valid_phys, reason_phys = verify_hardware_components_from_response(phys_resp)
+        self.assertFalse(valid_phys)
+
+    def test_03_valid_neutral_anchor_capture_and_no_jump(self):
+        """3. Verify neutral anchor capture and absence of initial motion jumps."""
+        self.assertFalse(self.node.motion_tracker.is_calibrated)
+        self.node.motion_tracker.calibrate(0.5, 0.5, 0.3)
+        self.assertTrue(self.node.motion_tracker.is_calibrated)
+
+        self.assertAlmostEqual(self.node.motion_tracker.smoothed_ux, 0.0, places=3)
+        self.assertAlmostEqual(self.node.motion_tracker.smoothed_uy, 0.0, places=3)
+        self.assertAlmostEqual(self.node.motion_tracker.smoothed_uz, 0.0, places=3)
+
+        self.node.reset_target_pose()
+        x0, y0, z0 = self.node.target_pose
+        self.assertAlmostEqual(x0, 0.0206, places=4)
+        self.assertAlmostEqual(y0, -0.2775, places=4)
+        self.assertAlmostEqual(z0, 0.2669, places=4)
+
+    def test_04_forward_backward_hand_to_arm_mapping(self):
+        """4. Verify reversed forward and backward hand displacement mapping."""
+        cfg = CartesianTargetConfig()
+        # Hand TOWARD camera (uz > 0) -> dy < 0 (robot arm extends forward along -Y)
+        dx_f, dy_f, dz_f = compute_cartesian_increment(0.0, 0.0, 0.5, 0.033, True, "GRIPPER_OPEN", True, cfg)
+        self.assertLess(dy_f, 0.0)
+        self.assertAlmostEqual(dx_f, 0.0)
+        self.assertAlmostEqual(dz_f, 0.0)
+
+        # Hand AWAY from camera (uz < 0) -> dy > 0 (robot arm retracts backward along +Y)
+        dx_b, dy_b, dz_b = compute_cartesian_increment(0.0, 0.0, -0.5, 0.033, True, "GRIPPER_OPEN", True, cfg)
+        self.assertGreater(dy_b, 0.0)
+        self.assertAlmostEqual(dx_b, 0.0)
+        self.assertAlmostEqual(dz_b, 0.0)
+
+    def test_05_left_right_hand_to_arm_mapping(self):
+        """5. Verify left and right hand displacement mapping."""
+        cfg = CartesianTargetConfig()
+        # Hand right (ux > 0) -> dx > 0 (robot arm moves to its right)
+        dx_r, dy_r, dz_r = compute_cartesian_increment(0.5, 0.0, 0.0, 0.033, True, "GRIPPER_OPEN", True, cfg)
+        self.assertGreater(dx_r, 0.0)
+        self.assertAlmostEqual(dy_r, 0.0)
+        self.assertAlmostEqual(dz_r, 0.0)
+
+        # Hand left (ux < 0) -> dx < 0 (robot arm moves to its left)
+        dx_l, dy_l, dz_l = compute_cartesian_increment(-0.5, 0.0, 0.0, 0.033, True, "GRIPPER_OPEN", True, cfg)
+        self.assertLess(dx_l, 0.0)
+        self.assertAlmostEqual(dy_l, 0.0)
+        self.assertAlmostEqual(dz_l, 0.0)
+
+    def test_06_cartesian_step_and_displacement_scaling(self):
+        """6. Verify per-frame step clamping and cumulative workspace limits."""
+        cfg = CartesianTargetConfig()
+        dx, dy, dz = compute_cartesian_increment(10.0, 10.0, 10.0, 1.0, True, "GRIPPER_OPEN", True, cfg)
+        self.assertLessEqual(abs(dx), cfg.MAX_CARTESIAN_STEP)
+        self.assertLessEqual(abs(dy), cfg.MAX_CARTESIAN_STEP)
+        self.assertLessEqual(abs(dz), cfg.MAX_CARTESIAN_STEP)
+
+        self.node.reset_target_pose()
+        init_x, init_y, init_z = self.node.target_pose
+        for _ in range(100):
+            self.node.update_cartesian_target(0.002, 0.0, 0.0)
+        tx, ty, tz = self.node.target_pose
+        self.assertLessEqual(tx - init_x, cfg.CUMULATIVE_LIMIT_X + 1e-6)
+
+    def test_07_joint_safety_limits_and_max_joint_delta(self):
+        """7. Verify MAX_JOINT_DELTA (0.100 rad) discontinuity guard."""
+        valid_candidate = {j: 0.08 for j in ARM_CONTROL_JOINTS}
+        self.assertTrue(self.node._validate_joint_discontinuity(valid_candidate))
+
+        excessive_candidate = {j: 0.12 for j in ARM_CONTROL_JOINTS}
+        self.assertFalse(self.node._validate_joint_discontinuity(excessive_candidate))
+
+    def test_08_velocity_limits_and_minimum_trajectory_duration(self):
+        """8. Verify commanded velocity bounds and minimum trajectory duration >= 0.50s."""
+        candidate = {j: 0.05 for j in ARM_CONTROL_JOINTS}
+        current = {j: 0.0 for j in EXPECTED_SO101_JOINTS}
+        now_msg = self.node.get_clock().now().to_msg()
+        goal, duration = build_trajectory_goal(candidate, current, now_msg)
+
+        self.assertGreaterEqual(duration, MIN_TRAJECTORY_DURATION)
+        max_delta = 0.05
+        min_expected = CUBIC_VELOCITY_SCALING_FACTOR * max_delta / MAX_COMMANDED_VELOCITY
+        self.assertGreaterEqual(duration, min_expected)
+
+    def test_09_stale_joint_state_rejection(self):
+        """9. Reject candidate dispatch when joint feedback is older than MAX_JOINT_STATE_AGE (0.25s)."""
+        candidate = {j: 0.05 for j in ARM_CONTROL_JOINTS}
+        self.node._last_joint_state_time = time.monotonic()
+        self.assertTrue(self.node._validate_joint_discontinuity(candidate))
+
+        self.node._last_joint_state_time = time.monotonic() - 0.50
+        self.assertFalse(self.node._validate_joint_discontinuity(candidate))
+
+    def test_10_one_active_goal_guard_and_newest_buffering(self):
+        """10. Guard against overlapping goals and buffer newest valid IK candidate."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+        ])
+        self.node._teleop_state = STATE_ARMED
+        self.node._goal_active = True
+
+        candidate1 = {j: 0.03 for j in ARM_CONTROL_JOINTS}
+        candidate2 = {j: 0.05 for j in ARM_CONTROL_JOINTS}
+
+        self.assertFalse(self.node.dispatch_arm_trajectory(candidate1))
+
+        self.node._handle_valid_ik_solution(candidate1)
+        self.assertEqual(self.node._pending_ik_candidate, candidate1)
+
+        self.node._handle_valid_ik_solution(candidate2)
+        self.assertEqual(self.node._pending_ik_candidate, candidate2)
+
+    def test_11_three_goal_session_limit_and_auto_disarm(self):
+        """11. Strictly enforce 3-goal session limit and automatic disarm upon completion."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("max_goals_per_session", value=3),
+        ])
+        self.node._teleop_state = STATE_ARMED
+        self.assertEqual(self.node.effective_session_goal_limit, 3)
+        self.assertEqual(self.node._session_goal_dispatch_count, 0)
+        self.assertFalse(self.node.is_session_goal_limit_reached())
+
+        # Goal 1
+        candidate1 = {j: 0.02 for j in ARM_CONTROL_JOINTS}
+        self.assertTrue(self.node.dispatch_arm_trajectory(candidate1))
+        self.assertEqual(self.node._session_goal_dispatch_count, 1)
+        self.node._goal_active = False
+
+        # Goal 2
+        candidate2 = {j: 0.04 for j in ARM_CONTROL_JOINTS}
+        self.assertTrue(self.node.dispatch_arm_trajectory(candidate2))
+        self.assertEqual(self.node._session_goal_dispatch_count, 2)
+        self.node._goal_active = False
+
+        # Goal 3 (Limit reached on dispatch)
+        candidate3 = {j: 0.06 for j in ARM_CONTROL_JOINTS}
+        self.assertTrue(self.node.dispatch_arm_trajectory(candidate3))
+        self.assertEqual(self.node._session_goal_dispatch_count, 3)
+        self.assertTrue(self.node.is_session_goal_limit_reached())
+
+        # Goal 4 (Rejected by session limit)
+        self.node._goal_active = False
+        candidate4 = {j: 0.08 for j in ARM_CONTROL_JOINTS}
+        self.assertFalse(self.node.dispatch_arm_trajectory(candidate4))
+        self.assertEqual(self.node._trajectory_last_status, "SESSION_GOAL_LIMIT_EXCEEDED")
+
+        # Result callback completes 3rd goal and triggers auto-disarm
+        mock_future = MagicMock()
+        mock_result = MagicMock()
+        mock_result.status = GoalStatus.STATUS_SUCCEEDED
+        mock_future.result.return_value = mock_result
+        self.node._goal_result_callback(mock_future)
+
+        self.assertEqual(self.node._teleop_state, STATE_DISARMED)
+        self.assertIsNone(self.node._pending_ik_candidate)
+
+    def test_12_disarm_via_d_cancels_active_goals_and_clears_buffers(self):
+        """12. Disarming via D cancels in-flight goals and purges pending IK candidates."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+        ])
+        self.node._teleop_state = STATE_ARMED
+        self.node._goal_active = True
+        mock_handle = MagicMock()
+        self.node._active_goal_handle = mock_handle
+        self.node._pending_ik_candidate = {j: 0.05 for j in ARM_CONTROL_JOINTS}
+
+        self.node.disarm("OPERATOR_REQUEST_D")
+        self.assertEqual(self.node._teleop_state, STATE_DISARMED)
+        mock_handle.cancel_goal_async.assert_called_once()
+        self.assertIsNone(self.node._pending_ik_candidate)
+        self.assertIsNone(self.node._pending_ik_snapshot)
+
+    def test_13_no_arm_goals_dispatched_after_disarm(self):
+        """13. Ensure zero arm goals can be dispatched while node is in DISARMED state."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+        ])
+        self.node._teleop_state = STATE_DISARMED
+        candidate = {j: 0.05 for j in ARM_CONTROL_JOINTS}
+        self.assertFalse(self.node.dispatch_arm_trajectory(candidate))
+        self.node.arm_action_client.send_goal_async.assert_not_called()
+
+    def test_14_gripper_independence_and_no_cross_talk(self):
+        """14. Confirm gripper gestures do not alter arm Cartesian targets or arm session quota."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("max_goals_per_session", value=3),
+        ])
+        self.node._teleop_state = STATE_ARMED
+        init_target = self.node.target_pose
+
+        self.node._send_gripper_command("GRIPPER_OPEN")
+        self.assertEqual(self.node._session_goal_dispatch_count, 0)
+        self.assertEqual(self.node.target_pose, init_target)
+
+        self.node._gripper_goal_active = False
+        self.node._send_gripper_command("GRIPPER_CLOSED")
+        self.assertEqual(self.node._session_goal_dispatch_count, 0)
+        self.assertEqual(self.node.target_pose, init_target)
+
+    def test_15_hud_preserved_structure(self):
+        """15. Confirm HUD rendering preserved with exact structure and no exceptions."""
+        frame = np.zeros((810, 1080, 3), dtype=np.uint8)
+        bbox = draw_compact_hud(
+            frame=frame,
+            hand_detected=True,
+            gesture_state="GRIPPER_OPEN",
+            gripper_state_text="OPEN",
+            control_state_text="ENABLED",
+            anchor_state_text="READY",
+            is_motion_enabled=True,
+        )
+        x1, y1, x2, y2 = bbox
+        self.assertGreater(x2, x1)
+        self.assertGreater(y2, y1)
+        self.assertLess(x1, 1080 * 0.05)
+        self.assertLess(y1, 810 * 0.05)
+        panel_pixels = frame[y1:y2, x1:x2]
+        self.assertGreater(np.count_nonzero(panel_pixels), 0)
+
+
+class TestArmMultiSessionRepeatabilityRecalibration(unittest.TestCase):
+    """
+    Unit & integration tests for Task 5C-3D-ARM-MULTI-SESSION-REPEATABILITY-RECALIBRATION-TEST:
+    - Session 1: Enable, auto-anchor, 1 bounded goal, manual disarm via D.
+    - Session 2: Re-arming, fresh neutral anchor capture, legitimate quota reset.
+    - No stale targets or pending buffers leaking across session boundaries.
+    - C-key manual recalibration: supported in both armed and disarmed states.
+    - Recalibration preserves current Cartesian target (no motion jumps) and does not bypass session quota.
+    - Bounded 3-goal session enforcement and automatic disarm upon quota completion.
+    - Gripper independence across sessions and recalibration.
+    - Asynchronous cancellation of active arm and gripper goals on disarm.
+    - Fail-closed default preservation (enable_arm_motion=False).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not rclpy.ok():
+            rclpy.init()
+
+    @classmethod
+    def tearDownClass(cls):
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    def setUp(self):
+        self.node = HandTeleopNode("test_multi_session_repeatability_node")
+        self.node._latest_joint_positions = {j: 0.0 for j in EXPECTED_SO101_JOINTS}
+        self.node._latest_joint_velocities = {j: 0.0 for j in EXPECTED_SO101_JOINTS}
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_mock_verified = True
+        self.node._hardware_last_verified_time = time.monotonic()
+        self.node.arm_action_client.server_is_ready = MagicMock(return_value=True)
+        self.node.gripper_action_client.server_is_ready = MagicMock(return_value=True)
+        self.mock_arm_future = MagicMock()
+        self.mock_gripper_future = MagicMock()
+        self.node.arm_action_client.send_goal_async = MagicMock(return_value=self.mock_arm_future)
+        self.node.gripper_action_client.send_goal_async = MagicMock(return_value=self.mock_gripper_future)
+        self.node.ik_client.call_async = MagicMock()
+
+    def tearDown(self):
+        self.node.destroy_node()
+
+    def _make_dummy_landmarks(self, mcp_x: float = 0.5, mcp_y: float = 0.5, wrist_y: float = 0.8):
+        class DummyLm:
+            def __init__(self, x, y, z=0.0):
+                self.x, self.y, self.z = x, y, z
+        lms = [DummyLm(mcp_x, mcp_y) for _ in range(21)]
+        lms[9] = DummyLm(mcp_x, mcp_y)
+        lms[0] = DummyLm(mcp_x, wrist_y)
+        return lms
+
+    def test_01_session1_enable_anchor_and_manual_disarm(self):
+        """1. Session 1: Enable, auto-anchor, dispatch 1 bounded goal, manual disarm via D."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("max_goals_per_session", value=3),
+        ])
+        self.assertEqual(self.node._teleop_state, STATE_DISARMED)
+        self.assertFalse(self.node.motion_tracker.is_calibrated)
+
+        lms1 = self._make_dummy_landmarks(0.5, 0.5, 0.8)
+        ok, reason = self.node.enable_teleoperation(hand_detected=True, gesture_state="GRIPPER_OPEN", landmarks=lms1)
+        self.assertTrue(ok)
+        self.assertEqual(self.node._teleop_state, STATE_ARMED)
+        self.assertTrue(self.node.motion_tracker.is_calibrated)
+        self.assertEqual(self.node.session_goal_dispatch_count, 0)
+        self.assertEqual(self.node.get_control_state_text(), "ENABLED")
+        self.assertEqual(self.node.get_anchor_state_text(), "READY")
+
+        # Dispatch 1 bounded goal
+        candidate = {j: 0.04 for j in ARM_CONTROL_JOINTS}
+        self.assertTrue(self.node.dispatch_arm_trajectory(candidate))
+        self.assertEqual(self.node.session_goal_dispatch_count, 1)
+
+        # Manual disarm via D
+        self.node.disarm("USER_REQUEST_D")
+        self.assertEqual(self.node._teleop_state, STATE_DISARMED)
+        self.assertFalse(self.node.motion_tracker.is_calibrated)
+        self.assertEqual(self.node.get_control_state_text(), "DISABLED")
+        self.assertEqual(self.node.get_anchor_state_text(), "NOT READY")
+        self.assertIsNone(self.node._pending_ik_candidate)
+        self.assertIsNone(self.node._last_submitted_ik_target)
+
+    def test_02_session2_rearm_legitimate_quota_reset_and_no_stale_targets(self):
+        """2. Session 2: Re-arm, fresh neutral anchor, legitimate quota reset, no stale targets."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("max_goals_per_session", value=3),
+        ])
+        # Simulate Session 1 ending with 2 goals dispatched
+        self.node._session_goal_dispatch_count = 2
+        self.node._last_submitted_ik_target = (0.05, -0.25, 0.28)
+        self.node._teleop_state = STATE_DISARMED
+
+        # Re-arm for Session 2 with a different hand position
+        lms2 = self._make_dummy_landmarks(0.42, 0.58, 0.85)
+        ok, reason = self.node.enable_teleoperation(hand_detected=True, gesture_state="GRIPPER_OPEN", landmarks=lms2)
+        self.assertTrue(ok)
+        self.assertEqual(self.node._teleop_state, STATE_ARMED)
+        # Legitimate quota reset to 0
+        self.assertEqual(self.node.session_goal_dispatch_count, 0)
+        # Old target purged
+        self.assertIsNone(self.node._last_submitted_ik_target)
+        # New anchor calibrated
+        self.assertTrue(self.node.motion_tracker.is_calibrated)
+        self.assertAlmostEqual(self.node.motion_tracker.anchor_x, 0.42, places=2)
+        self.assertAlmostEqual(self.node.motion_tracker.anchor_y, 0.58, places=2)
+
+    def test_03_c_key_manual_recalibration_in_armed_state(self):
+        """3. Manual C-key recalibration while ARMED: zeroes outputs, preserves target, preserves quota."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("max_goals_per_session", value=3),
+        ])
+        lms = self._make_dummy_landmarks(0.5, 0.5, 0.8)
+        self.node.enable_teleoperation(hand_detected=True, gesture_state="GRIPPER_OPEN", landmarks=lms)
+        self.node._session_goal_dispatch_count = 1
+        init_target = self.node.target_pose
+
+        # Simulate operator pressing C with shifted hand (0.55, 0.48, scale=0.32)
+        self.node.motion_tracker.calibrate(0.55, 0.48, 0.32)
+        self.assertTrue(self.node.motion_tracker.is_calibrated)
+        self.assertAlmostEqual(self.node.motion_tracker.anchor_x, 0.55, places=2)
+        self.assertAlmostEqual(self.node.motion_tracker.anchor_y, 0.48, places=2)
+
+        # Tracking outputs zeroed immediately
+        self.assertAlmostEqual(self.node.motion_tracker.smoothed_ux, 0.0)
+        self.assertAlmostEqual(self.node.motion_tracker.smoothed_uy, 0.0)
+        self.assertAlmostEqual(self.node.motion_tracker.smoothed_uz, 0.0)
+
+        # Target pose remains intact (no jump)
+        self.assertEqual(self.node.target_pose, init_target)
+
+        # Session quota must NOT be reset or manipulated by C
+        self.assertEqual(self.node.session_goal_dispatch_count, 1)
+
+    def test_04_c_key_manual_recalibration_in_disarmed_state(self):
+        """4. C-key recalibration in DISARMED state updates anchor but never arms node."""
+        self.node._teleop_state = STATE_DISARMED
+        self.assertFalse(self.node.motion_tracker.is_calibrated)
+
+        self.node.motion_tracker.calibrate(0.48, 0.52, 0.30)
+        self.assertTrue(self.node.motion_tracker.is_calibrated)
+        self.assertEqual(self.node.get_anchor_state_text(), "READY")
+        # Node must remain strictly DISARMED
+        self.assertEqual(self.node._teleop_state, STATE_DISARMED)
+        self.assertEqual(self.node.get_control_state_text(), "DISABLED")
+
+    def test_05_session2_three_goal_quota_and_automatic_disarm(self):
+        """5. Session 2 allows exactly 3 goals, rejects 4th, and auto-disarms on completion."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("max_goals_per_session", value=3),
+        ])
+        lms = self._make_dummy_landmarks()
+        self.node.enable_teleoperation(hand_detected=True, gesture_state="GRIPPER_OPEN", landmarks=lms)
+        self.assertEqual(self.node.session_goal_dispatch_count, 0)
+
+        # Goal 1
+        c1 = {j: 0.02 for j in ARM_CONTROL_JOINTS}
+        self.assertTrue(self.node.dispatch_arm_trajectory(c1))
+        self.assertEqual(self.node.session_goal_dispatch_count, 1)
+        self.node._goal_active = False
+
+        # Goal 2
+        c2 = {j: 0.04 for j in ARM_CONTROL_JOINTS}
+        self.assertTrue(self.node.dispatch_arm_trajectory(c2))
+        self.assertEqual(self.node.session_goal_dispatch_count, 2)
+        self.node._goal_active = False
+
+        # Goal 3
+        c3 = {j: 0.06 for j in ARM_CONTROL_JOINTS}
+        self.assertTrue(self.node.dispatch_arm_trajectory(c3))
+        self.assertEqual(self.node.session_goal_dispatch_count, 3)
+        self.assertTrue(self.node.is_session_goal_limit_reached())
+
+        # Goal 4 (Rejected)
+        self.node._goal_active = False
+        c4 = {j: 0.08 for j in ARM_CONTROL_JOINTS}
+        self.assertFalse(self.node.dispatch_arm_trajectory(c4))
+        self.assertEqual(self.node._trajectory_last_status, "SESSION_GOAL_LIMIT_EXCEEDED")
+
+        # Result callback completes Goal 3 -> auto-disarm triggered
+        mock_future = MagicMock()
+        mock_result = MagicMock()
+        mock_result.status = GoalStatus.STATUS_SUCCEEDED
+        mock_future.result.return_value = mock_result
+        self.node._goal_result_callback(mock_future)
+
+        self.assertEqual(self.node._teleop_state, STATE_DISARMED)
+        self.assertEqual(self.node._last_disarm_reason, "SESSION_GOAL_LIMIT_COMPLETED")
+
+    def test_06_gripper_independence_across_sessions_and_recalibration(self):
+        """6. Gripper commands operate independently and do not increment arm session goals."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("max_goals_per_session", value=3),
+        ])
+        lms = self._make_dummy_landmarks()
+        self.node.enable_teleoperation(hand_detected=True, gesture_state="GRIPPER_OPEN", landmarks=lms)
+
+        # Gripper transition OPEN -> CLOSED
+        self.assertTrue(self.node._send_gripper_command("GRIPPER_OPEN"))
+        self.assertEqual(self.node.session_goal_dispatch_count, 0)
+
+        # Recalibration
+        self.node.motion_tracker.calibrate(0.52, 0.49, 0.31)
+        self.assertEqual(self.node.session_goal_dispatch_count, 0)
+
+        # Gripper transition CLOSED
+        self.node._gripper_goal_active = False
+        self.assertTrue(self.node._send_gripper_command("GRIPPER_CLOSED"))
+        self.assertEqual(self.node.session_goal_dispatch_count, 0)
+
+    def test_07_cancellation_of_in_flight_arm_and_gripper_on_disarm(self):
+        """7. Disarming via D requests async cancellation of both arm and gripper goals."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+        ])
+        self.node._teleop_state = STATE_ARMED
+        self.node._goal_active = True
+        self.node._gripper_goal_active = True
+        mock_arm_handle = MagicMock()
+        mock_grip_handle = MagicMock()
+        self.node._active_goal_handle = mock_arm_handle
+        self.node._active_gripper_goal_handle = mock_grip_handle
+
+        self.node.disarm("USER_REQUEST_D")
+        mock_arm_handle.cancel_goal_async.assert_called_once()
+        mock_grip_handle.cancel_goal_async.assert_called_once()
+        self.assertEqual(self.node._teleop_state, STATE_DISARMED)
+
+    def test_08_fail_closed_source_default_preserved(self):
+        """8. Source code default of enable_arm_motion remains False."""
+        fresh_node = HandTeleopNode("test_fail_closed_verification_node")
+        try:
+            self.assertFalse(fresh_node.enable_arm_motion)
+            self.assertFalse(fresh_node.get_parameter("enable_arm_motion").value)
+        finally:
+            fresh_node.destroy_node()
+
+    def test_09_max_goals_per_session_semantics(self):
+        """9. max_goals_per_session=0 is unlimited, >0 enforces bounded session."""
+        fresh_node = HandTeleopNode("test_quota_semantics_node")
+        try:
+            # Default is 0 (unlimited)
+            self.assertEqual(fresh_node.effective_session_goal_limit, 0)
+            self.assertFalse(fresh_node.is_session_goal_limit_reached())
+
+            # Setting to 3 enforces limit
+            fresh_node.set_parameters([rclpy.parameter.Parameter("max_goals_per_session", value=3)])
+            self.assertEqual(fresh_node.effective_session_goal_limit, 3)
+            self.assertFalse(fresh_node.is_session_goal_limit_reached())
+            fresh_node._session_goal_dispatch_count = 3
+            self.assertTrue(fresh_node.is_session_goal_limit_reached())
+        finally:
+            fresh_node.destroy_node()
+
+
+class TestContinuousRealtimeArmControl(unittest.TestCase):
+    """
+    Focused regression & verification suite for 5C-3D-REALTIME-HAND-TO-ARM-CONTINUOUS-CONTROL:
+    - SO-101 URDF FK exact match & well-conditioned 3x5 translational Jacobian.
+    - Non-zero starting pose sync on [E] (no initial 50 mm / 0.2183 rad jump).
+    - Continuous multi-step tracking (> 20 consecutive steps, no 3-goal lockout).
+    - Bounded C^1 receding-horizon JointTrajectory message generation (no joint6).
+    - Stale hand input, stale /joint_states, controller tracking error, & collision watchdogs.
+    - Reliable [D] immediate hold & post-disarm suppression + gripper/HUD preservation.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not rclpy.ok():
+            rclpy.init()
+
+    @classmethod
+    def tearDownClass(cls):
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    def setUp(self):
+        self.node = HandTeleopNode("test_realtime_continuous_node")
+        self.node._latest_joint_positions = {j: 0.0 for j in EXPECTED_SO101_JOINTS}
+        self.node._latest_joint_velocities = {j: 0.0 for j in EXPECTED_SO101_JOINTS}
+        self.node._last_joint_state_time = time.monotonic()
+        self.node._hardware_mock_verified = True
+        self.node._hardware_last_verified_time = time.monotonic()
+        self.node.arm_action_client.server_is_ready = MagicMock(return_value=True)
+        self.node.gripper_action_client.server_is_ready = MagicMock(return_value=True)
+        self.node.gripper_action_client.send_goal_async = MagicMock(return_value=MagicMock())
+        self.published_msgs = []
+
+    def tearDown(self):
+        self.node.destroy_node()
+
+    def _make_hand(self, x=0.5, y=0.5, scale=0.25):
+        lms = [NormalizedLandmark(x=x, y=y) for _ in range(21)]
+        lms[9] = NormalizedLandmark(x=x, y=y)
+        lms[0] = NormalizedLandmark(x=x, y=y + scale)
+        return lms
+
+    def _make_preview(self, ux=0.0, uy=0.0, uz=0.0, calibrated=True):
+        return MotionPreviewData(
+            is_calibrated=calibrated,
+            anchor_x=0.5, anchor_y=0.5, anchor_scale=0.25,
+            curr_x=0.5, curr_y=0.5, curr_scale=0.25,
+            dx_raw=0.0, dy_raw=0.0, dz_raw=0.0,
+            ux=ux, uy=uy, uz=uz,
+            in_deadzone_x=(ux == 0.0), in_deadzone_y=(uy == 0.0), in_deadzone_z=(uz == 0.0),
+            all_in_deadzone=(ux == 0.0 and uy == 0.0 and uz == 0.0),
+            direction_str="ACTIVE",
+            axis_directions={"x": "NEUTRAL", "y": "NEUTRAL", "z": "NEUTRAL"},
+        )
+
+    def test_01_fail_closed_defaults_and_no_publisher_until_enabled(self):
+        """1. enable_arm_motion defaults False; /arm_controller/joint_trajectory publisher absent."""
+        self.assertFalse(self.node.enable_arm_motion)
+        self.assertIsNone(self.node.arm_trajectory_pub)
+        topic_names = [pub.topic_name for pub in self.node.publishers]
+        self.assertNotIn("/arm_controller/joint_trajectory", topic_names)
+        self.assertFalse(self.node.is_continuous_streaming_active())
+
+    def test_02_so101_fk_and_nonzero_enable_sync_eliminates_jump_lockout(self):
+        """2. Enabling [E] from moved pose [0.0123, -0.0192, -0.2153, -0.0704, 0.0] syncs target cleanly."""
+        kin = SO101Kinematics()
+        pos_zero, _ = kin.forward_kinematics([0.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertAlmostEqual(pos_zero[0], 0.0206, places=4)
+        self.assertAlmostEqual(pos_zero[1], -0.2775, places=4)
+        self.assertAlmostEqual(pos_zero[2], 0.2669, places=4)
+
+        moved_q = {
+            "joint1": 0.0123,
+            "joint2": -0.0192,
+            "joint3": -0.2153,
+            "joint4": -0.0704,
+            "joint5": 0.0,
+            "joint6": 0.0,
+        }
+        self.node._latest_joint_positions = moved_q
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+        ])
+        ok, reason = self.node.enable_teleoperation(
+            hand_detected=True, landmarks=self._make_hand(), gesture_state="GRIPPER_OPEN"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ARMED")
+        pos_moved, _ = kin.forward_kinematics([0.0123, -0.0192, -0.2153, -0.0704, 0.0])
+        self.assertAlmostEqual(self.node.target_pose[0], pos_moved[0], places=4)
+        self.assertAlmostEqual(self.node.target_pose[1], pos_moved[1], places=4)
+        self.assertAlmostEqual(self.node.target_pose[2], pos_moved[2], places=4)
+        self.assertAlmostEqual(self.node.target_pose[2], 0.3169, places=4)
+
+    def test_03_continuous_tracking_unbounded_past_3_segments_no_branch_jumps(self):
+        """3. Arm follows continuous >25 steps in X and Y without 3-goal lockout or joint jumps, keeping Z flat."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("enable_collision_checking", value=False),
+        ])
+        ok, _ = self.node.enable_teleoperation(
+            hand_detected=True, landmarks=self._make_hand(), gesture_state="GRIPPER_OPEN"
+        )
+        self.assertTrue(ok)
+        self.assertTrue(self.node.is_continuous_streaming_active())
+        self.node.arm_trajectory_pub.publish = lambda m: self.published_msgs.append(m)
+
+        # Authoritative 4-direction closed-loop position-following phases (+X right, -X left, -Y toward/extend, +Y away/retract)
+        phases = [
+            ("right", (0.8, 0.0, 0.0)),
+            ("left", (-0.8, 0.0, 0.0)),
+            ("toward_extend", (0.0, 0.0, 0.8)),
+            ("away_retract", (0.0, 0.0, -0.8)),
+        ]
+        for _, (ux, uy, uz) in phases:
+            for _ in range(10):
+                now = time.monotonic()
+                self.node._last_joint_state_time = now
+                self.node._hardware_last_verified_time = now
+                self.node.update_continuous_hand_input(
+                    self._make_preview(ux=ux, uy=uy, uz=uz),
+                    hand_detected=True,
+                    gesture_state="UNKNOWN",
+                    timestamp=now,
+                )
+                stepped = self.node._continuous_control_tick(dt_override=0.05)
+                self.assertTrue(stepped)
+                last_msg = self.published_msgs[-1]
+                self.assertEqual(last_msg.joint_names, ARM_CONTROL_JOINTS)
+                self.assertNotIn("joint6", last_msg.joint_names)
+                self.assertEqual(len(last_msg.points), 3)
+                # Verify step deltas stay strictly bounded <= MAX_JOINT_DELTA
+                for idx, jname in enumerate(ARM_CONTROL_JOINTS):
+                    dq = abs(last_msg.points[1].positions[idx] - self.node._latest_joint_positions[jname])
+                    self.assertLessEqual(dq, MAX_JOINT_DELTA + 1e-6)
+                    self.node._latest_joint_positions[jname] = last_msg.points[1].positions[idx]
+
+        # Far more than 3 segments executed continuously without auto-disarming
+        self.assertEqual(self.node.teleop_state, STATE_ARMED)
+        self.assertGreaterEqual(self.node._continuous_publish_count, 40)
+        self.assertEqual(len(self.published_msgs), 40)
+
+        # Also verify vertical hand component uy does not alter Z target when enable_vertical_z=False
+        self.node._continuous_input_uy = 0.9
+        self.assertAlmostEqual(self.node.target_pose[2], self.node._continuous_anchor_target[2], delta=0.003)
+
+    def test_04_hand_stops_causes_smooth_settle_and_hold(self):
+        """4. Zero hand velocity causes arm to settle smoothly and hold cleanly."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("enable_collision_checking", value=False),
+        ])
+        self.node.enable_teleoperation(
+            hand_detected=True, landmarks=self._make_hand(), gesture_state="GRIPPER_OPEN"
+        )
+        self.node.arm_trajectory_pub.publish = lambda m: self.published_msgs.append(m)
+
+        # Move right briefly
+        for _ in range(5):
+            now = time.monotonic()
+            self.node._last_joint_state_time = now
+            self.node._hardware_last_verified_time = now
+            self.node.update_continuous_hand_input(
+                self._make_preview(ux=0.8), True, "GRIPPER_OPEN", timestamp=now
+            )
+            self.node._continuous_control_tick(dt_override=0.05)
+            for i, j in enumerate(ARM_CONTROL_JOINTS):
+                self.node._latest_joint_positions[j] = self.published_msgs[-1].points[1].positions[i]
+
+        # Now stop hand -> velocity settles toward 0 and enters SETTLED_HOLD
+        for _ in range(30):
+            now = time.monotonic()
+            self.node._last_joint_state_time = now
+            self.node._hardware_last_verified_time = now
+            self.node.update_continuous_hand_input(
+                self._make_preview(0.0, 0.0, 0.0), True, "GRIPPER_OPEN", timestamp=now
+            )
+            self.node._continuous_control_tick(dt_override=0.05)
+            if self.published_msgs:
+                for i, j in enumerate(ARM_CONTROL_JOINTS):
+                    self.node._latest_joint_positions[j] = self.published_msgs[-1].points[1].positions[i]
+        self.assertEqual(self.node._continuous_last_status, "SETTLED_HOLD")
+        self.assertTrue(self.node._continuous_hold_published)
+        self.assertTrue(all(v == 0.0 for v in self.published_msgs[-1].points[1].velocities))
+
+    def test_05_stale_input_and_tracking_error_and_collision_watchdogs(self):
+        """5. Stale input holds; excessive tracking error disarms; collision pauses motion."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+        ])
+        self.node.enable_teleoperation(
+            hand_detected=True, landmarks=self._make_hand(), gesture_state="GRIPPER_OPEN"
+        )
+        self.node.arm_trajectory_pub.publish = lambda m: self.published_msgs.append(m)
+
+        # A. Stale hand input > CONTINUOUS_WATCHDOG_TIMEOUT (0.30s)
+        self.node._continuous_last_input_time = time.monotonic() - 0.50
+        self.assertFalse(self.node._continuous_control_tick(dt_override=0.05))
+        self.assertEqual(self.node._continuous_last_status, "INPUT_TIMEOUT_HOLD")
+
+        # B. Collision check False blocks advancing
+        now = time.monotonic()
+        self.node._last_joint_state_time = now
+        self.node._hardware_last_verified_time = now
+        self.node.update_continuous_hand_input(
+            self._make_preview(ux=0.8), True, "GRIPPER_OPEN", timestamp=now
+        )
+        self.node._collision_free = False
+        self.assertFalse(self.node._continuous_control_tick(dt_override=0.05))
+        self.assertEqual(self.node._continuous_last_status, "COLLISION_BLOCKED")
+        self.node._collision_free = True
+
+        # C. Tracking error via /arm_controller/controller_state disarms immediately
+        cs = JointTrajectoryControllerState()
+        cs.joint_names = list(ARM_CONTROL_JOINTS)
+        cs.error.positions = [0.25, 0.0, 0.0, 0.0, 0.0]
+        self.node._arm_controller_state_callback(cs)
+        self.assertFalse(self.node._continuous_control_tick(dt_override=0.05))
+        self.assertEqual(self.node.teleop_state, STATE_DISARMED)
+        self.assertEqual(self.node._last_disarm_reason, "TRACKING_ERROR_EXCEEDED")
+
+    def test_06_d_key_hold_post_disarm_silence_and_gripper_hud_intact(self):
+        """6. [D] publishes zero-velocity hold trajectory, blocks subsequent streaming, preserves gripper/HUD."""
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("enable_collision_checking", value=False),
+        ])
+        self.node.enable_teleoperation(
+            hand_detected=True, landmarks=self._make_hand(), gesture_state="GRIPPER_OPEN"
+        )
+        self.node.arm_trajectory_pub.publish = lambda m: self.published_msgs.append(m)
+
+        now = time.monotonic()
+        self.node.update_continuous_hand_input(
+            self._make_preview(ux=0.7), True, "GRIPPER_OPEN", timestamp=now
+        )
+        self.assertTrue(self.node._continuous_control_tick(dt_override=0.05))
+
+        # Independent gripper actuation during continuous arm control
+        self.assertTrue(self.node._send_gripper_command("GRIPPER_OPEN"))
+        self.node._gripper_goal_active = False
+        self.assertTrue(self.node._send_gripper_command("GRIPPER_CLOSED"))
+
+        # Press D -> immediate hold + cancel flag + no further streaming commands
+        self.node.disarm("USER_KEYPRESS_D")
+        self.assertEqual(self.node.teleop_state, STATE_DISARMED)
+        self.assertTrue(self.node._cancel_requested_on_disarm)
+        hold_msg = self.published_msgs[-1]
+        self.assertTrue(all(v == 0.0 for v in hold_msg.points[-1].velocities))
+
+        count_before = len(self.published_msgs)
+        self.assertFalse(self.node._continuous_control_tick(dt_override=0.05))
+        self.assertEqual(len(self.published_msgs), count_before)
+
+        # HUD remains completely intact
+        frame = np.zeros((810, 1080, 3), dtype=np.uint8)
+        x1, y1, x2, y2 = draw_compact_hud(frame, True, "GRIPPER_OPEN", "OPEN", "DISABLED", True, anchor_state_text="NOT READY")
+        self.assertGreater(x2, x1)
+        self.assertGreater(y2, y1)
+
+
+class TestRealtimeHandMappingIntegration(unittest.TestCase):
+    """Comprehensive tests (1-17) for Task 5C-3D-REALTIME-HAND-MAPPING-CORRECTION-AND-INTEGRATION."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not rclpy.ok():
+            rclpy.init()
+
+    @classmethod
+    def tearDownClass(cls):
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    def setUp(self):
+        self.node = HandTeleopNode("test_realtime_hand_mapping_node")
+        self.published_msgs = []
+        now = time.monotonic()
+        self.node._latest_joint_positions = {j: 0.0 for j in EXPECTED_SO101_JOINTS}
+        self.node._latest_joint_velocities = {j: 0.0 for j in EXPECTED_SO101_JOINTS}
+        self.node._last_joint_state_time = now
+        self.node._hardware_mock_verified = True
+        self.node._hardware_last_verified_time = now
+        self.node.arm_action_client.server_is_ready = MagicMock(return_value=True)
+        self.node.gripper_action_client.server_is_ready = MagicMock(return_value=True)
+        self.node.arm_action_client.send_goal_async = MagicMock(return_value=MagicMock())
+        self.node.gripper_action_client.send_goal_async = MagicMock(return_value=MagicMock())
+        self.node.ik_client.call_async = MagicMock()
+        self.node.state_validity_client.call_async = MagicMock()
+        self.kin = SO101Kinematics()
+
+    def tearDown(self):
+        self.node.destroy_node()
+
+    def _make_hand(self, x=0.5, y=0.5, scale=0.25):
+        lms = [NormalizedLandmark(x=x, y=y) for _ in range(21)]
+        lms[9] = NormalizedLandmark(x=x, y=y)
+        lms[0] = NormalizedLandmark(x=x, y=y + scale)
+        return lms
+
+    def _step_closed_loop_tracker(self, tracker, x, y, scale, steps=12, gesture="GRIPPER_OPEN"):
+        for k in range(steps):
+            now = time.monotonic()
+            self.node._last_joint_state_time = now
+            self.node._hardware_last_verified_time = now
+            lms = self._make_hand(x=x, y=y, scale=scale)
+            prev = tracker.update(True, lms, timestamp=now)
+            self.node.update_continuous_hand_input(prev, True, gesture, timestamp=now)
+            stepped = self.node._continuous_control_tick(dt_override=0.05)
+            if stepped and self.published_msgs:
+                last_msg = self.published_msgs[-1]
+                for idx, jname in enumerate(ARM_CONTROL_JOINTS):
+                    self.node._latest_joint_positions[jname] = last_msg.points[1].positions[idx]
+
+    def _enable_continuous_at_home(self, anchor_x=0.5, anchor_y=0.5, anchor_scale=0.25, gesture="GRIPPER_OPEN"):
+        self.node.set_parameters([
+            rclpy.parameter.Parameter("enable_motion", value=True),
+            rclpy.parameter.Parameter("enable_arm_motion", value=True),
+            rclpy.parameter.Parameter("enable_collision_checking", value=False),
+        ])
+        now = time.monotonic()
+        self.node._last_joint_state_time = now
+        self.node._hardware_last_verified_time = now
+        ok, reason = self.node.enable_teleoperation(
+            hand_detected=True,
+            landmarks=self._make_hand(x=anchor_x, y=anchor_y, scale=anchor_scale),
+            gesture_state=gesture,
+        )
+        self.assertTrue(ok, reason)
+        self.node.arm_trajectory_pub.publish = lambda m: self.published_msgs.append(m)
+        p0, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        return p0
+
+    def test_01_left_right_mapping_sign_and_fk(self):
+        """1. Hand RIGHT (ux>0) moves robot +X and Hand LEFT (ux<0) moves robot -X."""
+        p0 = self._enable_continuous_at_home()
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.35, y=0.5, scale=0.25, steps=20)
+        p_right, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertGreater(p_right[0] - p0[0], 0.015)
+
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.65, y=0.5, scale=0.25, steps=40)
+        p_left, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertLess(p_left[0] - p0[0], -0.015)
+
+    def test_02_reversed_depth_mapping_toward_extends_away_retracts(self):
+        """2. TOWARD webcam (uz>0) extends robot forward (-Y); AWAY (uz<0) retracts backward (+Y)."""
+        p0 = self._enable_continuous_at_home()
+        # Move TOWARD camera (larger palm scale) -> forward extension (-Y)
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.5, y=0.5, scale=0.36, steps=25)
+        p_fwd, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertLess(p_fwd[1] - p0[1], -0.015)
+
+        # Return then move AWAY from camera (smaller palm scale) -> backward retraction (+Y)
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.5, y=0.5, scale=0.17, steps=55)
+        p_back, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertGreater(p_back[1] - p0[1], 0.015)
+
+    def test_03_vertical_z_disabled_by_default_and_3x5_dls_intact(self):
+        """3. Robot vertical Z stays anchored in 4-dir mode while 3x5 DLS Z kinematics stay intact."""
+        p0 = self._enable_continuous_at_home()
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.35, y=0.20, scale=0.25, steps=25)
+        p_curr, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertAlmostEqual(p_curr[2], p0[2], delta=0.002)
+        self.assertGreater(p_curr[0] - p0[0], 0.015)
+
+        # Enabling enable_vertical_z allows vertical Z tracking
+        self.node.set_parameters([rclpy.parameter.Parameter("enable_vertical_z", value=True)])
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.50, y=0.25, scale=0.25, steps=25)
+        p_up, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertGreater(p_up[2] - p0[2], 0.010)
+
+    def test_04_symmetric_log_scale_depth(self):
+        """4. Log-scale depth dz_raw = log(curr_scale / anchor_scale) yields equal +/- magnitudes."""
+        tracker = MotionPreviewTracker(MAPPING_CONFIG)
+        tracker.calibrate(0.5, 0.5, 0.25, timestamp=100.0)
+        p_close = tracker.update(True, self._make_hand(0.5, 0.5, 0.25 * 1.35), timestamp=100.1)
+
+        tracker_far = MotionPreviewTracker(MAPPING_CONFIG)
+        tracker_far.calibrate(0.5, 0.5, 0.25, timestamp=100.0)
+        p_far = tracker_far.update(True, self._make_hand(0.5, 0.5, 0.25 / 1.35), timestamp=100.1)
+
+        self.assertAlmostEqual(p_close.dz_raw, -p_far.dz_raw, places=6)
+        self.assertAlmostEqual(p_close.ux, 0.0, places=6)
+        self.assertAlmostEqual(p_far.ux, 0.0, places=6)
+        self.assertAlmostEqual(p_close.uz, -p_far.uz, places=4)
+
+    def test_05_off_center_horizontal_balance(self):
+        """5. Off-center neutral anchor_x=0.25 balances rightward headroom before FoV clipping."""
+        tracker = MotionPreviewTracker(MAPPING_CONFIG)
+        tracker.calibrate(0.25, 0.5, 0.25, timestamp=100.0)
+        prev = None
+        for i in range(15):
+            # Move 0.16 to the right inside [0.05, 0.25] FoV margin -> reaches near full scale
+            prev = tracker.update(True, self._make_hand(x=0.09, y=0.5, scale=0.25), timestamp=100.1 + 0.05 * i)
+        self.assertGreater(prev.ux, 0.70)
+
+    def test_06_pinhole_compensation_and_crosstalk_suppression(self):
+        """6. Off-center AWAY perspective shrink suppresses spurious X cross-talk while preserving diagonals."""
+        tracker = MotionPreviewTracker(MAPPING_CONFIG)
+        # Replicate measured off-center anchor (x=0.30, y=0.58)
+        tracker.calibrate(0.30, 0.58, 0.25, timestamp=100.0)
+        ratio = 0.68
+        # Under pinhole projection around center 0.5, straight backward hand pulls radially toward center
+        proj_x = 0.5 + (0.30 - 0.5) * ratio
+        proj_y = 0.5 + (0.58 - 0.5) * ratio
+        prev = None
+        for i in range(10):
+            prev = tracker.update(True, self._make_hand(x=proj_x, y=proj_y, scale=0.25 * ratio), timestamp=100.1 + 0.05 * i)
+        self.assertLess(prev.uz, -0.75)
+        self.assertLess(abs(prev.ux), 0.15)
+
+        # Genuine 45-degree diagonal (RIGHT + TOWARD) passes both axes cleanly
+        tracker_diag = MotionPreviewTracker(MAPPING_CONFIG)
+        tracker_diag.calibrate(0.50, 0.50, 0.25, timestamp=100.0)
+        for i in range(10):
+            prev_diag = tracker_diag.update(True, self._make_hand(x=0.33, y=0.50, scale=0.25 * 1.38), timestamp=100.1 + 0.05 * i)
+        self.assertGreater(prev_diag.ux, 0.45)
+        self.assertGreater(prev_diag.uz, 0.45)
+
+    def test_07_neutral_deadband_suppresses_resting_tremor(self):
+        """7. Resting jitter within deadzone yields exact zero normalized outputs."""
+        tracker = MotionPreviewTracker(MAPPING_CONFIG)
+        tracker.calibrate(0.50, 0.50, 0.25, timestamp=100.0)
+        jitter = [(0.512, 0.491, 0.255), (0.489, 0.511, 0.244), (0.506, 0.498, 0.252)]
+        for i, (jx, jy, js) in enumerate(jitter):
+            p = tracker.update(True, self._make_hand(jx, jy, js), timestamp=100.1 + 0.05 * i)
+            self.assertEqual((p.ux, p.uy, p.uz), (0.0, 0.0, 0.0))
+            self.assertTrue(p.all_in_deadzone)
+
+    def test_08_multi_frame_anchor_capture_and_zero_initial_jump(self):
+        """8. E averages buffered valid frames into stable neutral anchor and syncs FK pose with zero jump."""
+        now = time.monotonic()
+        for k, dx in enumerate((-0.01, 0.01, -0.005, 0.005)):
+            self.node.motion_tracker.update(
+                True, self._make_hand(0.50 + dx, 0.50, 0.25), timestamp=now - 0.2 + 0.04 * k
+            )
+        p0 = self._enable_continuous_at_home(anchor_x=0.50, anchor_y=0.50, anchor_scale=0.25)
+        self.assertGreaterEqual(self.node.motion_tracker._anchor_sample_count, 5)
+        self.assertAlmostEqual(self.node.motion_tracker.anchor_x, 0.50, places=3)
+        for idx in range(3):
+            self.assertAlmostEqual(self.node._continuous_anchor_target[idx], p0[idx], places=4)
+        # First tick right after E with zero displacement executes without any jump
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.50, y=0.50, scale=0.25, steps=3)
+        self.assertEqual(len(self.published_msgs), 0)
+
+    def test_09_bounded_position_following_settles_without_windup(self):
+        """9. Holding hand displaced settles cleanly within ~50 mm anchor span without runaway integration."""
+        p0 = self._enable_continuous_at_home()
+        # Saturate full RIGHT for 60 ticks (3 seconds): stays strictly bounded <= span (~50 mm)
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.15, y=0.50, scale=0.25, steps=60)
+        p_held, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        dx = p_held[0] - p0[0]
+        self.assertGreater(dx, 0.040)
+        self.assertLessEqual(dx, self.node.continuous_position_span + 0.002)
+        self.assertEqual(self.node._continuous_last_status, "SETTLED_HOLD")
+
+    def test_10_return_hand_to_neutral_returns_ee_to_reference(self):
+        """10. Moving hand back to neutral returns EE smoothly toward the E reference pose."""
+        p0 = self._enable_continuous_at_home()
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.35, y=0.50, scale=0.36, steps=35)
+        p_mid, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertGreater(math.dist(p_mid, p0), 0.025)
+
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.50, y=0.50, scale=0.25, steps=55)
+        p_back, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertLess(math.dist(p_back, p0), 0.003)
+
+    def test_11_stationary_displaced_hand_holds_target_without_drift(self):
+        """11. Holding a displaced hand still settles at that target and stops publishing redundant moves."""
+        self._enable_continuous_at_home()
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.50, y=0.50, scale=0.32, steps=45)
+        self.assertEqual(self.node._continuous_last_status, "SETTLED_HOLD")
+        count_settled = len(self.published_msgs)
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.50, y=0.50, scale=0.32, steps=15)
+        self.assertEqual(len(self.published_msgs), count_settled)
+
+    def test_12_c_recalibration_clutching_preserves_target_zero_jump(self):
+        """12. Pressing C recalibrates neutral hand anchor and preserves current EE pose with zero jump."""
+        p0 = self._enable_continuous_at_home()
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.38, y=0.50, scale=0.25, steps=25)
+        target_before = self.node.target_pose
+        self.assertGreater(target_before[0] - p0[0], 0.015)
+
+        # Recalibrate right at displaced hand position x=0.38 -> zero jump
+        ok, reason = self.node.recalibrate_anchor(self._make_hand(0.38, 0.50, 0.25), timestamp=time.monotonic())
+        self.assertTrue(ok, reason)
+        self.assertAlmostEqual(self.node.motion_tracker.anchor_x, 0.38, places=4)
+        self.assertEqual(self.node.target_pose, target_before)
+        self.assertEqual(self.node._continuous_anchor_target, target_before)
+
+    def test_13_transient_unknown_gripper_does_not_drop_arm_tracking(self):
+        """13. Transient UNKNOWN gripper classifications never stall valid continuous arm tracking."""
+        p0 = self._enable_continuous_at_home(gesture="UNKNOWN")
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.36, y=0.50, scale=0.25, steps=20, gesture="UNKNOWN")
+        p_curr, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertGreater(p_curr[0] - p0[0], 0.015)
+
+    def test_14_hand_loss_nan_degenerate_scale_and_watchdog_stop_safely(self):
+        """14. Hand loss, NaN coords, degenerate scale (<1e-4), and stale input stop motion safely."""
+        self._enable_continuous_at_home()
+        # NaN and degenerate scale blocked by tracker + validator
+        nan_lms = self._make_hand(0.5, 0.5, 0.25)
+        nan_lms[9] = NormalizedLandmark(x=float("nan"), y=0.5)
+        self.assertFalse(self.node._validate_landmarks(nan_lms, min_scale=1e-4)[0])
+        tiny_lms = self._make_hand(0.5, 0.5, 1e-6)
+        prev_tiny = self.node.motion_tracker.update(True, tiny_lms)
+        self.assertEqual((prev_tiny.ux, prev_tiny.uy, prev_tiny.uz), (0.0, 0.0, 0.0))
+
+        # Stale input past watchdog triggers INPUT_TIMEOUT_HOLD
+        now = time.monotonic()
+        self.node.update_continuous_hand_input(
+            MotionPreviewData(True, 0.5, 0.5, 0.25, 0.4, 0.5, 0.25, 0.1, 0.0, 0.0, 0.8, 0.0, 0.0, False, True, True, False, "RIGHT", {}),
+            True,
+            "GRIPPER_OPEN",
+            timestamp=now - (CONTINUOUS_WATCHDOG_TIMEOUT + 0.10),
+        )
+        self.assertFalse(self.node._continuous_control_tick(dt_override=0.05))
+        self.assertEqual(self.node._continuous_last_status, "INPUT_TIMEOUT_HOLD")
+
+    def test_15_gripper_independent_and_unknown_never_moves_gripper(self):
+        """15. Gripper open/close acts cleanly while tracking arm; UNKNOWN never commands gripper."""
+        self._enable_continuous_at_home()
+        count_arm_before = len(self.published_msgs)
+        self.assertFalse(self.node._send_gripper_command("UNKNOWN"))
+        self.assertEqual(self.node._gripper_dispatch_count, 0)
+        self.assertTrue(self.node._send_gripper_command("GRIPPER_OPEN"))
+        self.assertEqual(self.node._gripper_dispatch_count, 1)
+        self.node._gripper_goal_active = False
+        self.assertTrue(self.node._send_gripper_command("GRIPPER_CLOSED"))
+        self.assertEqual(self.node._gripper_dispatch_count, 2)
+        self.assertEqual(len(self.published_msgs), count_arm_before)
+
+    def test_16_fail_closed_defaults_and_joint_velocity_safety_bound(self):
+        """16. Default enable_arm_motion=False preserved and continuous joint speed stays <= 0.20 rad/s."""
+        fresh_node = HandTeleopNode("test_defaults_check_node")
+        try:
+            self.assertFalse(fresh_node.enable_arm_motion)
+            self.assertEqual(fresh_node.continuous_max_joint_velocity, 0.20)
+            self.assertAlmostEqual(fresh_node.continuous_position_span, 0.05, places=4)
+            self.assertFalse(fresh_node.enable_vertical_z)
+        finally:
+            fresh_node.destroy_node()
+
+        self._enable_continuous_at_home()
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.10, y=0.50, scale=0.40, steps=20)
+        for msg in self.published_msgs:
+            v_peak = max(abs(v) for v in msg.points[1].velocities)
+            self.assertLessEqual(v_peak, 0.20 + 1e-4)
+
+    def test_17_full_end_to_end_four_direction_cycle_plus_recover(self):
+        """17. Full R -> Neutral -> L -> Neutral -> Toward (-Y) -> Neutral -> Away (+Y) -> D -> Re-arm E cycle."""
+        p0 = self._enable_continuous_at_home()
+        # Right -> +X
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.34, y=0.50, scale=0.25, steps=30)
+        pr, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertGreater(pr[0] - p0[0], 0.020)
+        # Left -> -X
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.66, y=0.50, scale=0.25, steps=55)
+        pl, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertLess(pl[0] - p0[0], -0.020)
+        # Return Neutral -> Toward -> -Y extend
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.50, y=0.50, scale=0.25, steps=45)
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.50, y=0.50, scale=0.36, steps=35)
+        pt, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertLess(pt[1] - p0[1], -0.015)
+        # Away -> +Y retract
+        self._step_closed_loop_tracker(self.node.motion_tracker, x=0.50, y=0.50, scale=0.17, steps=55)
+        pa, _ = self.kin.forward_kinematics([self.node._latest_joint_positions[j] for j in ARM_CONTROL_JOINTS])
+        self.assertGreater(pa[1] - p0[1], 0.015)
+        # D stops -> Re-arm E succeeds cleanly from moved pose
+        self.node.disarm("USER_KEYPRESS_D")
+        self.assertEqual(self.node.teleop_state, STATE_DISARMED)
+        p_rearm = self._enable_continuous_at_home()
+        self.assertAlmostEqual(math.dist(p_rearm, pa), 0.0, places=4)
+
+    def test_18_hand_teleop_launch_configuration(self):
+        """18. hand_teleop.launch.py declares compact sim defaults and resolves .venv_hand_gesture python."""
+        import importlib.util
+
+        launch_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "src",
+            "hand_gesture_teleop",
+            "launch",
+            "hand_teleop.launch.py",
+        )
+        self.assertTrue(os.path.isfile(launch_path), f"Missing launch file: {launch_path}")
+        spec = importlib.util.spec_from_file_location("hand_teleop_launch", launch_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        venv_py = mod._find_venv_python()
+        self.assertTrue(venv_py.endswith(".venv_hand_gesture/bin/python3"))
+        self.assertTrue(os.path.isfile(venv_py))
+
+        ld = mod.generate_launch_description()
+        declared = {
+            e.name: e.default_value[0].text
+            for e in ld.entities
+            if hasattr(e, "name") and hasattr(e, "default_value")
+        }
+        self.assertEqual(declared["enable_motion"], "true")
+        self.assertEqual(declared["enable_arm_motion"], "true")
+        self.assertEqual(declared["max_goals_per_session"], "0")
+        self.assertEqual(declared["continuous_arm_control"], "true")
+        self.assertEqual(declared["enable_collision_checking"], "true")
+        self.assertEqual(declared["enable_vertical_z"], "false")
+        self.assertEqual(declared["continuous_position_span"], "0.05")
+        self.assertEqual(declared["continuous_max_joint_velocity"], "0.20")
 
 
 if __name__ == "__main__":

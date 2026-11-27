@@ -21,8 +21,11 @@ and NO ROS 2 publishers, subscribers, or action clients. It is safe to import
 headlessly or in any ROS 2 node.
 """
 
+import math
 import os
 import subprocess
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -120,14 +123,36 @@ class GestureConfig:
 @dataclass(frozen=True)
 class MappingConfig:
     # Dead-zone thresholds: displacements within these margins produce 0.0 (holding steady)
-    DEADZONE_X: float = 0.05       # 5% of normalized horizontal screen space
+    DEADZONE_X: float = 0.045      # >2.5x measured neutral tremor max (0.0176)
     DEADZONE_Y: float = 0.05       # 5% of normalized vertical screen space
-    DEADZONE_Z: float = 0.08       # 8% relative change in 2D palm scale (monocular depth proxy)
+    DEADZONE_Z: float = 0.10       # ~10.5% log-scale ratio deadband to suppress HOLD drift
 
     # Maximum expected displacement corresponding to full-scale output (+/- 1.0)
     MAX_DISPLACEMENT_X: float = 0.20
     MAX_DISPLACEMENT_Y: float = 0.20
-    MAX_DISPLACEMENT_Z: float = 0.35
+    MAX_DISPLACEMENT_Z: float = 0.35  # Symmetric log-scale: exp(+0.35)=1.42x, exp(-0.35)=0.70x
+
+    # Calibration-aware FoV edge headroom for balanced Left/Right reachability
+    FOV_MARGIN_X: float = 0.05
+    MIN_EFFECTIVE_SPAN_X: float = 0.10
+    FOV_HEADROOM_SCALE: float = 0.85
+
+    # Pinhole perspective compensation for off-center TOWARD/AWAY moves
+    PINHOLE_CENTER_X: float = 0.50
+    PINHOLE_CENTER_Y: float = 0.50
+    PINHOLE_COMP_GAIN: float = 0.85
+    PINHOLE_SCALE_MIN: float = 0.55
+    PINHOLE_SCALE_MAX: float = 1.65
+
+    # Soft cross-talk attenuation between lateral (X) and depth (Z) axes
+    CROSSTALK_SUPPRESS_LOW: float = 0.35
+    CROSSTALK_SUPPRESS_HIGH: float = 0.65
+
+    # Multi-frame neutral anchor capture
+    ANCHOR_BUFFER_FRAMES: int = 5
+    ANCHOR_BUFFER_MAX_AGE: float = 0.60
+    ANCHOR_REFINE_SETTLE_X: float = 0.015
+    ANCHOR_REFINE_SETTLE_Z: float = 0.030
 
     # Exponential moving average filter factor (0.0 = frozen, 1.0 = raw/unfiltered)
     SMOOTHING_ALPHA: float = 0.35
@@ -457,7 +482,8 @@ def apply_deadzone_and_scale(val: float, deadzone: float, max_disp: float) -> Tu
 class MotionPreviewTracker:
     """
     Tracks relative hand displacement from a user-calibrated neutral anchor.
-    Computes dead zones, smooth outputs, and intended directions.
+    Computes symmetric log-scale depth, pinhole off-center perspective compensation,
+    FoV-balanced horizontal spans, soft X/Z cross-talk suppression, and EMA smoothing.
     """
 
     def __init__(self, cfg: MappingConfig = MAPPING_CONFIG):
@@ -467,16 +493,140 @@ class MotionPreviewTracker:
         self.anchor_y: Optional[float] = None
         self.anchor_scale: Optional[float] = None
 
+        # Calibration-aware horizontal headroom spans (+ux right, -ux left)
+        self._anchor_span_x_pos: float = cfg.MAX_DISPLACEMENT_X
+        self._anchor_span_x_neg: float = cfg.MAX_DISPLACEMENT_X
+
+        # Recent valid raw hand pose buffer for multi-frame neutral anchor capture
+        self._recent_samples: deque = deque(maxlen=max(1, int(cfg.ANCHOR_BUFFER_FRAMES)))
+        self._anchor_sample_count: int = 0
+        self._anchor_refining: bool = False
+
         # Filtered outputs
         self.smoothed_ux: float = 0.0
         self.smoothed_uy: float = 0.0
         self.smoothed_uz: float = 0.0
 
-    def calibrate(self, lm9_x: float, lm9_y: float, palm_scale_2d: float) -> bool:
-        """Capture the current hand position and scale as the neutral anchor."""
-        self.anchor_x = float(lm9_x)
-        self.anchor_y = float(lm9_y)
-        self.anchor_scale = max(float(palm_scale_2d), 1e-4)
+    def _update_anchor_spans(self) -> None:
+        """Compute balanced positive/negative X scaling headroom relative to webcam FoV edges."""
+        if self.anchor_x is None:
+            self._anchor_span_x_pos = self.cfg.MAX_DISPLACEMENT_X
+            self._anchor_span_x_neg = self.cfg.MAX_DISPLACEMENT_X
+            return
+        margin = self.cfg.FOV_MARGIN_X
+        min_span = max(self.cfg.MIN_EFFECTIVE_SPAN_X, self.cfg.DEADZONE_X + 0.02)
+        avail_right = max(0.0, self.anchor_x - margin)
+        avail_left = max(0.0, (1.0 - margin) - self.anchor_x)
+        self._anchor_span_x_pos = float(
+            np.clip(self.cfg.FOV_HEADROOM_SCALE * avail_right, min_span, self.cfg.MAX_DISPLACEMENT_X)
+        )
+        self._anchor_span_x_neg = float(
+            np.clip(self.cfg.FOV_HEADROOM_SCALE * avail_left, min_span, self.cfg.MAX_DISPLACEMENT_X)
+        )
+
+    def _record_sample(
+        self,
+        lm9_x: float,
+        lm9_y: float,
+        palm_scale_2d: float,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """Buffer valid finite hand poses for multi-frame median anchor averaging."""
+        if not (math.isfinite(lm9_x) and math.isfinite(lm9_y) and math.isfinite(palm_scale_2d)):
+            return
+        if palm_scale_2d < 1e-4:
+            return
+        ts = time.monotonic() if timestamp is None else float(timestamp)
+        self._recent_samples.append((ts, float(lm9_x), float(lm9_y), float(palm_scale_2d)))
+
+    def _suppress_xz_crosstalk(self, raw_ux: float, raw_uz: float) -> Tuple[float, float]:
+        """Smoothly attenuate weak minor-axis coupling when X or Z clearly dominates."""
+        ax = abs(raw_ux)
+        az = abs(raw_uz)
+        major = max(ax, az)
+        minor = min(ax, az)
+        if major < 1e-6 or minor < 1e-6:
+            return raw_ux, raw_uz
+
+        ratio = minor / major
+        lo = self.cfg.CROSSTALK_SUPPRESS_LOW
+        hi = max(lo + 1e-4, self.cfg.CROSSTALK_SUPPRESS_HIGH)
+        if ratio >= hi:
+            return raw_ux, raw_uz
+        weight = max(0.0, min(1.0, (ratio - lo) / (hi - lo)))
+        if ax < az:
+            return raw_ux * weight, raw_uz
+        return raw_ux, raw_uz * weight
+
+    def _neutral_preview(self, curr_x: float, curr_y: float, curr_scale: float, status: str) -> MotionPreviewData:
+        """Build a zeroed MotionPreviewData packet preserving current calibration fields."""
+        return MotionPreviewData(
+            is_calibrated=self.is_calibrated,
+            anchor_x=self.anchor_x,
+            anchor_y=self.anchor_y,
+            anchor_scale=self.anchor_scale,
+            curr_x=curr_x,
+            curr_y=curr_y,
+            curr_scale=curr_scale,
+            dx_raw=0.0,
+            dy_raw=0.0,
+            dz_raw=0.0,
+            ux=0.0,
+            uy=0.0,
+            uz=0.0,
+            in_deadzone_x=True,
+            in_deadzone_y=True,
+            in_deadzone_z=True,
+            all_in_deadzone=True,
+            direction_str=status,
+            axis_directions={"x": "NEUTRAL", "y": "NEUTRAL", "z": "NEUTRAL"},
+        )
+
+    def calibrate(
+        self,
+        lm9_x: float,
+        lm9_y: float,
+        palm_scale_2d: float,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Capture neutral anchor using multi-frame median over recent matching frames when available."""
+        x_val = float(lm9_x)
+        y_val = float(lm9_y)
+        scale_val = float(palm_scale_2d)
+        if not (math.isfinite(x_val) and math.isfinite(y_val) and math.isfinite(scale_val)):
+            return False
+
+        safe_scale = max(scale_val, 1e-4)
+        now = time.monotonic() if timestamp is None else float(timestamp)
+        max_age = self.cfg.ANCHOR_BUFFER_MAX_AGE
+
+        # Select fresh recent samples consistent with the hand pose at enable/calibrate time
+        matching = [
+            (sx, sy, ss)
+            for (ts, sx, sy, ss) in self._recent_samples
+            if (now - ts) <= max_age
+            and abs(sx - x_val) <= 0.06
+            and abs(sy - y_val) <= 0.06
+            and 0.75 <= (ss / safe_scale) <= 1.33
+        ]
+        if matching:
+            matching.append((x_val, y_val, safe_scale))
+            xs = [m[0] for m in matching]
+            ys = [m[1] for m in matching]
+            scales = [m[2] for m in matching]
+            self.anchor_x = float(np.median(xs))
+            self.anchor_y = float(np.median(ys))
+            self.anchor_scale = max(float(np.median(scales)), 1e-4)
+            self._anchor_sample_count = len(matching)
+            self._anchor_refining = len(matching) < int(self.cfg.ANCHOR_BUFFER_FRAMES)
+        else:
+            self.anchor_x = x_val
+            self.anchor_y = y_val
+            self.anchor_scale = safe_scale
+            self._anchor_sample_count = 1
+            self._anchor_refining = True
+
+        self._update_anchor_spans()
         self.is_calibrated = True
         self.smoothed_ux = 0.0
         self.smoothed_uy = 0.0
@@ -489,6 +639,10 @@ class MotionPreviewTracker:
         self.anchor_x = None
         self.anchor_y = None
         self.anchor_scale = None
+        self._anchor_span_x_pos = self.cfg.MAX_DISPLACEMENT_X
+        self._anchor_span_x_neg = self.cfg.MAX_DISPLACEMENT_X
+        self._anchor_sample_count = 0
+        self._anchor_refining = False
         self.smoothed_ux = 0.0
         self.smoothed_uy = 0.0
         self.smoothed_uz = 0.0
@@ -503,32 +657,30 @@ class MotionPreviewTracker:
         self,
         hand_detected: bool,
         landmarks: Optional[list] = None,
+        timestamp: Optional[float] = None,
     ) -> MotionPreviewData:
         """
         Compute relative displacements, dead zones, and direction labels.
-        Immediately returns zero/neutral outputs if hand is untracked or uncalibrated.
+        Immediately returns zero/neutral outputs if hand is untracked, invalid, or uncalibrated.
         """
         # Case 1: Untracked or no hand detected
         if not hand_detected or landmarks is None or len(landmarks) < 21:
             self.reset_tracking()
-            return MotionPreviewData(
-                is_calibrated=self.is_calibrated,
-                anchor_x=self.anchor_x,
-                anchor_y=self.anchor_y,
-                anchor_scale=self.anchor_scale,
-                curr_x=0.0, curr_y=0.0, curr_scale=0.0,
-                dx_raw=0.0, dy_raw=0.0, dz_raw=0.0,
-                ux=0.0, uy=0.0, uz=0.0,
-                in_deadzone_x=True, in_deadzone_y=True, in_deadzone_z=True,
-                all_in_deadzone=True,
-                direction_str="NEUTRAL (NO HAND)",
-                axis_directions={"x": "NEUTRAL", "y": "NEUTRAL", "z": "NEUTRAL"},
-            )
+            return self._neutral_preview(0.0, 0.0, 0.0, "NEUTRAL (NO HAND)")
 
         # Extract current hand reference: Landmark 9 (Middle MCP) and 2D palm scale (0 to 9)
-        curr_x = landmarks[9].x
-        curr_y = landmarks[9].y
-        curr_scale = dist_2d(landmarks[0], landmarks[9])
+        curr_x = float(landmarks[9].x)
+        curr_y = float(landmarks[9].y)
+        curr_scale = float(dist_2d(landmarks[0], landmarks[9]))
+
+        if (
+            not (math.isfinite(curr_x) and math.isfinite(curr_y) and math.isfinite(curr_scale))
+            or curr_scale < 1e-4
+        ):
+            self.reset_tracking()
+            return self._neutral_preview(0.0, 0.0, 0.0, "NEUTRAL (INVALID)")
+
+        self._record_sample(curr_x, curr_y, curr_scale, timestamp=timestamp)
 
         # Case 2: Hand is detected, but user has not yet calibrated anchor
         if not self.is_calibrated or self.anchor_x is None or self.anchor_y is None or self.anchor_scale is None:
@@ -545,23 +697,59 @@ class MotionPreviewTracker:
                 axis_directions={"x": "NEUTRAL", "y": "NEUTRAL", "z": "NEUTRAL"},
             )
 
+        # Optional brief sub-deadzone anchor refinement when calibrated from a single frame
+        clamped_scale = max(curr_scale, 1e-4)
+        if self._anchor_refining:
+            within_settle = (
+                abs(curr_x - self.anchor_x) <= self.cfg.ANCHOR_REFINE_SETTLE_X
+                and abs(curr_y - self.anchor_y) <= self.cfg.ANCHOR_REFINE_SETTLE_X
+                and abs(math.log(clamped_scale / self.anchor_scale)) <= self.cfg.ANCHOR_REFINE_SETTLE_Z
+            )
+            if within_settle and self._anchor_sample_count < int(self.cfg.ANCHOR_BUFFER_FRAMES):
+                n = self._anchor_sample_count
+                self.anchor_x = (self.anchor_x * n + curr_x) / (n + 1)
+                self.anchor_y = (self.anchor_y * n + curr_y) / (n + 1)
+                self.anchor_scale = (self.anchor_scale * n + clamped_scale) / (n + 1)
+                self._anchor_sample_count = n + 1
+                self._update_anchor_spans()
+                if self._anchor_sample_count >= int(self.cfg.ANCHOR_BUFFER_FRAMES):
+                    self._anchor_refining = False
+            else:
+                self._anchor_refining = False
+
         # Case 3: Calibrated hand tracking active -> compute relative offsets
-        # Horizontal: Right = positive, Left = negative
-        # In unmirrored camera space, user motion to the left increases X on the sensor;
-        # inverting the sign (anchor_x - curr_x) ensures moving LEFT produces negative dx_raw (LEFT)
-        # and moving RIGHT produces positive dx_raw (RIGHT).
-        dx_raw = self.anchor_x - curr_x
+        # Symmetric log-scale depth: CLOSER > 0, FARTHER < 0 (exp(+0.35)=1.42x, exp(-0.35)=0.70x)
+        dz_raw = math.log(clamped_scale / self.anchor_scale)
+
+        # Pinhole radial perspective compensation removes spurious X/Y shift when moving off-center in Z
+        scale_ratio = float(
+            np.clip(clamped_scale / self.anchor_scale, self.cfg.PINHOLE_SCALE_MIN, self.cfg.PINHOLE_SCALE_MAX)
+        )
+        proj_factor = 1.0 + self.cfg.PINHOLE_COMP_GAIN * (scale_ratio - 1.0)
+        anchor_x_proj = self.cfg.PINHOLE_CENTER_X + (self.anchor_x - self.cfg.PINHOLE_CENTER_X) * proj_factor
+        anchor_y_proj = self.cfg.PINHOLE_CENTER_Y + (self.anchor_y - self.cfg.PINHOLE_CENTER_Y) * proj_factor
+        depth_norm = 1.0 / float(np.clip(scale_ratio, 0.70, 1.30))
+
+        # Horizontal: Right = positive, Left = negative (unmirrored webcam convention)
+        dx_raw = (anchor_x_proj - curr_x) * depth_norm
 
         # Vertical: Up = positive, Down = negative (image Y is inverted: 0 at top, 1 at bottom)
-        dy_raw = self.anchor_y - curr_y
+        dy_raw = (anchor_y_proj - curr_y) * depth_norm
 
-        # Apparent Depth: Closer = positive (larger palm scale), Farther = negative (smaller palm scale)
-        dz_raw = (curr_scale - self.anchor_scale) / self.anchor_scale
-
-        # Dead-zone and scaling
-        raw_ux, in_dz_x = apply_deadzone_and_scale(dx_raw, self.cfg.DEADZONE_X, self.cfg.MAX_DISPLACEMENT_X)
+        # Dead-zone and FoV-balanced scaling
+        span_x = self._anchor_span_x_pos if dx_raw >= 0.0 else self._anchor_span_x_neg
+        raw_ux, in_dz_x = apply_deadzone_and_scale(dx_raw, self.cfg.DEADZONE_X, span_x)
         raw_uy, in_dz_y = apply_deadzone_and_scale(dy_raw, self.cfg.DEADZONE_Y, self.cfg.MAX_DISPLACEMENT_Y)
         raw_uz, in_dz_z = apply_deadzone_and_scale(dz_raw, self.cfg.DEADZONE_Z, self.cfg.MAX_DISPLACEMENT_Z)
+
+        # Soft lateral-vs-depth cross-talk suppression (preserves genuine diagonal arcs)
+        raw_ux, raw_uz = self._suppress_xz_crosstalk(raw_ux, raw_uz)
+        if abs(raw_ux) < 1e-6:
+            raw_ux = 0.0
+            in_dz_x = True
+        if abs(raw_uz) < 1e-6:
+            raw_uz = 0.0
+            in_dz_z = True
 
         # Exponential moving average filter
         alpha = self.cfg.SMOOTHING_ALPHA
@@ -646,30 +834,47 @@ def draw_motion_reticle(
         cv2.circle(frame, (cx, cy), 4, line_color, -1)
 
 
+DEFAULT_KEYBOARD_SHORTCUTS: List[str] = [
+    "[E] Enable (Auto-Anchor)",
+    "[D] Disable",
+    "[C] Recalibrate",
+    "[R] Reset",
+    "[Q] Quit",
+]
+
+
 def draw_compact_hud(
     frame: np.ndarray,
     hand_detected: bool,
     gesture_state: str,
     gripper_state_text: str = "IDLE",
-    control_state_text: str = "DISARMED",
+    control_state_text: str = "DISABLED",
     is_motion_enabled: bool = False,
-    help_text: str = "Hotkeys: [Q/Esc] Quit",
+    help_text: Optional[str] = None,
     status_heading: Optional[str] = None,
     anchor_state_text: str = "NOT READY",
+    keyboard_shortcuts: Optional[List[str]] = None,
 ) -> Tuple[int, int, int, int]:
     """
-    Renders a compact, single-panel HUD in the top-left corner of the camera frame.
+    Renders a compact, single-panel structured HUD in the top-left corner of the camera frame.
     Leaves the central view completely unobstructed for hand tracking and gestures.
-    Renders text at native display resolution with crisp antialiased Full HD TrueType typography.
+    Renders text at native display resolution with crisp antialiased TrueType typography.
 
-    Essential display elements (Tasks 5C-3D-UI-FIX & 5C-3D-SINGLE-KEY-ARM-DISARM-AUTO-ANCHOR):
-      1. Status heading: PREVIEW ONLY — NO ROBOT COMMANDS or HAND TELEOP — SIMULATION.
-      2. Hand presence: HAND: DETECTED / NOT DETECTED.
-      3. Gesture state: GESTURE: OPEN / CLOSED / UNKNOWN with concise 2-finger hint.
-      4. Gripper state: GRIPPER: IDLE / OPEN / CLOSED / PENDING / ERROR.
-      5. Control state: CONTROL: DISARMED / ARMED with bounded session quota if active.
-      6. Neutral motion anchor: MOTION ANCHOR: READY / NOT READY.
-      7. Applicable hotkeys help line.
+    Structured display elements (Task 5C-3D-HUD-STRUCTURE-STATUS-CLEANUP):
+      - Title: HAND TELEOP – SIMULATION
+      - Status Column Table:
+          HAND:             DETECTED / NOT DETECTED
+          GESTURE:          OPEN / CLOSED / UNKNOWN
+          GRIPPER:          OPEN / CLOSED / PENDING / ERROR / IDLE
+          CONTROL:          ENABLED / DISABLED
+          MOTION ANCHOR:    READY / NOT READY
+      - Keyboard Section:
+          Keyboard:
+          [E] Enable (Auto-Anchor)
+          [D] Disable
+          [C] Recalibrate
+          [R] Reset
+          [Q] Quit
 
     Returns the bounding box (card_x1, card_y1, card_x2, card_y2) of the rendered card.
     """
@@ -678,11 +883,148 @@ def draw_compact_hud(
     # Reference scaling factor (1080px width baseline)
     scale = max(0.60, min(1.4, w / 1080.0))
 
-    # Panel geometry: compact card in top-left corner (strictly <= 32% w, <= 22% h)
+    # 1. Resolve heading text and style
+    if status_heading is not None:
+        heading = status_heading
+    elif not is_motion_enabled:
+        heading = "PREVIEW ONLY — NO ROBOT COMMANDS"
+    else:
+        heading = "HAND TELEOP — SIMULATION"
+
+    header_box_fill = (15, 45, 25) if is_motion_enabled else (45, 35, 15)
+    header_text_color = (120, 255, 140) if is_motion_enabled else (255, 215, 0)
+
+    # 2. Resolve status values & colors (Part B & Part D)
+    hand_val = "DETECTED" if hand_detected else "NOT DETECTED"
+    hand_rgb = (80, 240, 120) if hand_detected else (240, 80, 80)
+
+    g_upper = gesture_state.upper().strip()
+    if g_upper in ("GRIPPER_OPEN", "OPEN"):
+        g_label = "OPEN"
+        g_rgb = (80, 240, 120)
+    elif g_upper in ("GRIPPER_CLOSED", "CLOSED"):
+        g_label = "CLOSED"
+        g_rgb = (255, 175, 60)
+    else:
+        g_label = "UNKNOWN"
+        g_rgb = (190, 195, 205)
+
+    grip_upper = gripper_state_text.upper().strip()
+    if "OPEN" in grip_upper:
+        grip_val = "OPEN"
+        grip_rgb = (80, 240, 120)
+    elif "CLOSED" in grip_upper:
+        grip_val = "CLOSED"
+        grip_rgb = (255, 175, 60)
+    elif "PENDING" in grip_upper:
+        grip_val = "PENDING"
+        grip_rgb = (255, 230, 80)
+    elif "ERROR" in grip_upper or "FAIL" in grip_upper:
+        grip_val = "ERROR"
+        grip_rgb = (240, 80, 80)
+    else:
+        grip_val = "IDLE"
+        grip_rgb = (190, 195, 205)
+
+    # Control state must be strictly ENABLED or DISABLED (Part B)
+    ctrl_upper = control_state_text.upper().strip()
+    if (ctrl_upper in ("ENABLED", "ARMED") or "ENABLED" in ctrl_upper) and (
+        "DISABLED" not in ctrl_upper and "DISARMED" not in ctrl_upper
+    ):
+        ctrl_val = "ENABLED"
+        ctrl_rgb = (80, 240, 120)
+    else:
+        ctrl_val = "DISABLED"
+        ctrl_rgb = (240, 80, 80)
+
+    # Motion anchor status
+    anc_upper = anchor_state_text.upper().strip()
+    if "READY" in anc_upper and "NOT" not in anc_upper:
+        anc_val = "READY"
+        anc_rgb = (80, 240, 120)
+    else:
+        anc_val = "NOT READY"
+        anc_rgb = (240, 80, 80)
+
+    lbl_rgb = (185, 190, 200)
+    kb_head_rgb = (220, 225, 235)
+    kb_text_rgb = (170, 180, 195)
+
+    # 3. Resolve keyboard instructions list
+    if keyboard_shortcuts is not None:
+        kb_lines = list(keyboard_shortcuts)
+    elif help_text is not None and not is_motion_enabled and "Q" in help_text and len(help_text) < 30:
+        kb_lines = [help_text]
+    else:
+        kb_lines = list(DEFAULT_KEYBOARD_SHORTCUTS)
+
+    status_rows = [
+        ("HAND:", hand_val, hand_rgb),
+        ("GESTURE:", g_label, g_rgb),
+        ("GRIPPER:", grip_val, grip_rgb),
+        ("CONTROL:", ctrl_val, ctrl_rgb),
+        ("MOTION ANCHOR:", anc_val, anc_rgb),
+    ]
+
+    # 4. Spacing and geometry metrics
     margin_x = max(8, int(round(12 * scale)))
     margin_y = max(8, int(round(12 * scale)))
-    panel_w = int(round(w * 0.300))
-    panel_h = int(round(h * 0.210))
+    pad_x = max(8, int(round(10 * scale)))
+    header_h = max(18, int(round(22 * scale)))
+    row_step = max(13, int(round(17 * scale)))
+    gap_y = max(6, int(round(8 * scale)))
+    kb_head_step = max(12, int(round(15 * scale)))
+    kb_step = max(11, int(round(14 * scale)))
+    bot_pad = max(6, int(round(8 * scale)))
+
+    # Fonts
+    font_head = _get_truetype_font(max(8, int(round(10 * scale))), bold=True)
+    font_body = _get_truetype_font(max(8, int(round(11 * scale))), bold=True)
+    font_key_head = _get_truetype_font(max(7, int(round(9.5 * scale))), bold=True)
+    font_key = _get_truetype_font(max(7, int(round(9 * scale))), bold=False)
+
+    head_font_scale = max(0.35, 0.40 * scale)
+    body_font_scale = max(0.32, 0.36 * scale)
+    key_head_font_scale = max(0.28, 0.33 * scale)
+    key_font_scale = max(0.26, 0.30 * scale)
+
+    use_pil = _HAS_PIL and font_head is not None and font_body is not None and font_key is not None
+
+    if use_pil:
+        def txt_w(text, font):
+            bbox = font.getbbox(text)
+            return bbox[2] - bbox[0]
+
+        max_lbl_w = max(txt_w(item[0], font_body) for item in status_rows)
+        col_gap = max(8, int(round(12 * scale)))
+        val_x = pad_x + max_lbl_w + col_gap
+        max_val_w = max(txt_w(item[1], font_body) for item in status_rows)
+        status_w = val_x + max_val_w + pad_x
+        head_w = txt_w(heading, font_head) + pad_x * 2
+        max_kb_w = max(txt_w(line, font_key) for line in kb_lines) + pad_x * 2
+    else:
+        def cv_txt_w(text, fscale):
+            return cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, fscale, 1)[0][0]
+
+        max_lbl_w = max(cv_txt_w(item[0], body_font_scale) for item in status_rows)
+        col_gap = max(8, int(round(12 * scale)))
+        val_x = pad_x + max_lbl_w + col_gap
+        max_val_w = max(cv_txt_w(item[1], body_font_scale) for item in status_rows)
+        status_w = val_x + max_val_w + pad_x
+        head_w = cv_txt_w(heading, head_font_scale) + pad_x * 2
+        max_kb_w = max(cv_txt_w(line, key_font_scale) for line in kb_lines) + pad_x * 2
+
+    content_w = max(head_w, status_w, max_kb_w)
+    panel_w = max(int(round(w * 0.28)), min(int(round(w * 0.315)), content_w + max(10, int(round(14 * scale)))))
+    panel_h = (
+        header_h
+        + int(round(4 * scale))
+        + (len(status_rows) * row_step)
+        + gap_y
+        + kb_head_step
+        + (len(kb_lines) * kb_step)
+        + bot_pad
+    )
 
     card_x1 = margin_x
     card_y1 = margin_y
@@ -691,73 +1033,11 @@ def draw_compact_hud(
     actual_w = card_x2 - card_x1
     actual_h = card_y2 - card_y1
 
-    # 1. Solid opaque high-contrast dark background card (100% solid, no bleed-through)
-    frame[card_y1:card_y2, card_x1:card_x2] = (22, 16, 14)  # BGR dark navy/charcoal
+    # 5. Render solid opaque dark navy/charcoal background card
+    frame[card_y1:card_y2, card_x1:card_x2] = (22, 18, 14)  # BGR
     cv2.rectangle(frame, (card_x1, card_y1), (card_x2, card_y2), (110, 95, 85), 2, cv2.LINE_AA)
 
-    # 2. Resolve heading text and style
-    if status_heading is not None:
-        heading = status_heading
-    elif not is_motion_enabled:
-        heading = "PREVIEW ONLY — NO ROBOT COMMANDS"
-    else:
-        heading = "HAND TELEOP — SIMULATION"
-
-    header_h = max(16, int(round(20 * scale)))
-    # RGB colors for PIL
-    header_box_fill = (45, 35, 15) if not is_motion_enabled else (15, 45, 25)
-    header_text_color = (255, 215, 0) if not is_motion_enabled else (120, 255, 140)
-
-    # 3. Resolve status colors and labels
-    hand_val = "DETECTED" if hand_detected else "NOT DETECTED"
-    hand_rgb = (100, 245, 120) if hand_detected else (245, 80, 80)
-
-    if gesture_state == "GRIPPER_OPEN":
-        g_label = "OPEN"
-        g_rgb = (60, 255, 100)
-    elif gesture_state == "GRIPPER_CLOSED":
-        g_label = "CLOSED"
-        g_rgb = (255, 180, 50)
-    else:
-        g_label = "UNKNOWN"
-        g_rgb = (180, 185, 195)
-
-    grip_upper = gripper_state_text.upper()
-    if "OPEN" in grip_upper:
-        grip_rgb = (100, 255, 140)
-    elif "CLOSED" in grip_upper:
-        grip_rgb = (255, 180, 50)
-    elif "PENDING" in grip_upper:
-        grip_rgb = (255, 230, 80)
-    elif "ERROR" in grip_upper or "FAIL" in grip_upper:
-        grip_rgb = (240, 80, 80)
-    else:
-        grip_rgb = (190, 195, 205)
-
-    ctrl_upper = control_state_text.upper()
-    if "ARMED" in ctrl_upper and "DISARMED" not in ctrl_upper:
-        ctrl_rgb = (80, 255, 100)
-    elif "PENDING" in ctrl_upper:
-        ctrl_rgb = (255, 230, 80)
-    else:
-        ctrl_rgb = (255, 180, 50)
-
-    anc_upper = anchor_state_text.upper()
-    if "READY" in anc_upper and "NOT" not in anc_upper:
-        anc_rgb = (80, 255, 100)
-    else:
-        anc_rgb = (255, 180, 50)
-
-    pad_x_inner = max(6, int(round(8 * scale)))
-    val_x_inner = pad_x_inner + max(66, int(round(88 * scale)))
-
-    # 4. Render with TrueType fonts via Pillow if available
-    font_head = _get_truetype_font(max(8, int(round(10 * scale))), bold=True)
-    font_body = _get_truetype_font(max(8, int(round(11 * scale))), bold=True)
-    font_hint = _get_truetype_font(max(7, int(round(9 * scale))), bold=False)
-    font_foot = _get_truetype_font(max(7, int(round(9 * scale))), bold=False)
-
-    if _HAS_PIL and font_head is not None and font_body is not None and font_hint is not None:
+    if use_pil:
         card_bgr = frame[card_y1:card_y2, card_x1:card_x2]
         card_rgb = cv2.cvtColor(card_bgr, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(card_rgb)
@@ -765,44 +1045,29 @@ def draw_compact_hud(
 
         # Header bar
         draw.rectangle([(2, 2), (actual_w - 3, header_h - 2)], fill=header_box_fill)
-        draw.text((pad_x_inner, max(2, int(round(3 * scale)))), heading, font=font_head, fill=header_text_color)
+        draw.text((pad_x, max(2, int(round(3 * scale)))), heading, font=font_head, fill=header_text_color)
 
-        # Content rows
-        row_y = header_h + max(2, int(round(4 * scale)))
-        row_step = max(12, int(round(16 * scale)))
+        # Status rows (Column 1: labels, Column 2: values)
+        curr_y = header_h + int(round(4 * scale))
+        for lbl, val, val_col in status_rows:
+            draw.text((pad_x, curr_y), lbl, font=font_body, fill=lbl_rgb)
+            draw.text((val_x, curr_y), val, font=font_body, fill=val_col)
+            curr_y += row_step
 
-        # Row 1: Hand Status
-        draw.text((pad_x_inner, row_y), "HAND:", font=font_body, fill=(210, 215, 225))
-        draw.text((val_x_inner, row_y), hand_val, font=font_body, fill=hand_rgb)
-        row_y += row_step
+        # Section gap & Keyboard Header
+        curr_y += gap_y
+        draw.text((pad_x, curr_y), "Keyboard:", font=font_key_head, fill=kb_head_rgb)
+        curr_y += kb_head_step
 
-        # Row 2: Gesture State
-        draw.text((pad_x_inner, row_y), "GESTURE:", font=font_body, fill=(210, 215, 225))
-        draw.text((val_x_inner, row_y), g_label, font=font_body, fill=g_rgb)
-        row_y += row_step
-
-        # Row 3: Gripper State
-        draw.text((pad_x_inner, row_y), "GRIPPER:", font=font_body, fill=(210, 215, 225))
-        draw.text((val_x_inner, row_y), gripper_state_text, font=font_body, fill=grip_rgb)
-        row_y += row_step
-
-        # Row 4: Control State & Quota
-        draw.text((pad_x_inner, row_y), "CONTROL:", font=font_body, fill=(210, 215, 225))
-        draw.text((val_x_inner, row_y), control_state_text, font=font_body, fill=ctrl_rgb)
-        row_y += row_step
-
-        # Row 5: Neutral Motion Anchor Status
-        draw.text((pad_x_inner, row_y), "MOTION ANCHOR:", font=font_body, fill=(210, 215, 225))
-        draw.text((val_x_inner, row_y), anchor_state_text, font=font_body, fill=anc_rgb)
-        row_y += row_step
-
-        # Row 6: Hotkeys Help
-        draw.text((pad_x_inner, row_y), help_text, font=font_foot if font_foot is not None else font_hint, fill=(160, 165, 175))
+        # Keyboard shortcuts
+        for line in kb_lines:
+            draw.text((pad_x, curr_y), line, font=font_key, fill=kb_text_rgb)
+            curr_y += kb_step
 
         frame[card_y1:card_y2, card_x1:card_x2] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
     else:
-        # Fallback to OpenCV with FONT_HERSHEY_DUPLEX
+        # Fallback to OpenCV FONT_HERSHEY_DUPLEX
         def rgb2bgr(c):
             return (c[2], c[1], c[0])
 
@@ -813,14 +1078,10 @@ def draw_compact_hud(
             rgb2bgr(header_box_fill),
             -1,
         )
-        head_font_scale = max(0.32, 0.38 * scale)
-        body_font_scale = max(0.30, 0.35 * scale)
-        small_font_scale = max(0.26, 0.30 * scale)
-
         cv2.putText(
             frame,
             heading,
-            (card_x1 + pad_x_inner, card_y1 + header_h - int(round(4 * scale))),
+            (card_x1 + pad_x, card_y1 + header_h - int(round(5 * scale))),
             cv2.FONT_HERSHEY_DUPLEX,
             head_font_scale,
             rgb2bgr(header_text_color),
@@ -828,36 +1089,19 @@ def draw_compact_hud(
             cv2.LINE_AA,
         )
 
-        row_y = card_y1 + header_h + int(round(13 * scale))
-        row_step = max(12, int(round(16 * scale)))
+        curr_y = card_y1 + header_h + int(round(14 * scale))
+        for lbl, val, val_col in status_rows:
+            cv2.putText(frame, lbl, (card_x1 + pad_x, curr_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, rgb2bgr(lbl_rgb), 1, cv2.LINE_AA)
+            cv2.putText(frame, val, (card_x1 + val_x, curr_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, rgb2bgr(val_col), 1, cv2.LINE_AA)
+            curr_y += row_step
 
-        # Row 1
-        cv2.putText(frame, "HAND:", (card_x1 + pad_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, (215, 205, 200), 1, cv2.LINE_AA)
-        cv2.putText(frame, hand_val, (card_x1 + val_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, rgb2bgr(hand_rgb), 1, cv2.LINE_AA)
-        row_y += row_step
+        curr_y += gap_y
+        cv2.putText(frame, "Keyboard:", (card_x1 + pad_x, curr_y), cv2.FONT_HERSHEY_DUPLEX, key_head_font_scale, rgb2bgr(kb_head_rgb), 1, cv2.LINE_AA)
+        curr_y += kb_head_step
 
-        # Row 2
-        cv2.putText(frame, "GESTURE:", (card_x1 + pad_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, (215, 205, 200), 1, cv2.LINE_AA)
-        cv2.putText(frame, g_label, (card_x1 + val_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, rgb2bgr(g_rgb), 1, cv2.LINE_AA)
-        row_y += row_step
-
-        # Row 3
-        cv2.putText(frame, "GRIPPER:", (card_x1 + pad_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, (215, 205, 200), 1, cv2.LINE_AA)
-        cv2.putText(frame, gripper_state_text, (card_x1 + val_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, rgb2bgr(grip_rgb), 1, cv2.LINE_AA)
-        row_y += row_step
-
-        # Row 4
-        cv2.putText(frame, "CONTROL:", (card_x1 + pad_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, (215, 205, 200), 1, cv2.LINE_AA)
-        cv2.putText(frame, control_state_text, (card_x1 + val_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, rgb2bgr(ctrl_rgb), 1, cv2.LINE_AA)
-        row_y += row_step
-
-        # Row 5
-        cv2.putText(frame, "MOTION ANCHOR:", (card_x1 + pad_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, (215, 205, 200), 1, cv2.LINE_AA)
-        cv2.putText(frame, anchor_state_text, (card_x1 + val_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, body_font_scale, rgb2bgr(anc_rgb), 1, cv2.LINE_AA)
-        row_y += row_step
-
-        # Row 6
-        cv2.putText(frame, help_text, (card_x1 + pad_x_inner, row_y), cv2.FONT_HERSHEY_DUPLEX, small_font_scale, (170, 160, 155), 1, cv2.LINE_AA)
+        for line in kb_lines:
+            cv2.putText(frame, line, (card_x1 + pad_x, curr_y), cv2.FONT_HERSHEY_DUPLEX, key_font_scale, rgb2bgr(kb_text_rgb), 1, cv2.LINE_AA)
+            curr_y += kb_step
 
     return (card_x1, card_y1, card_x2, card_y2)
 
@@ -875,14 +1119,15 @@ def draw_mapping_hud(
     banner_text_color: Tuple[int, int, int] = (0, 230, 255),
     is_motion_enabled: bool = False,
     gripper_state_text: str = "IDLE",
-    control_state_text: str = "DISARMED",
-    help_text: str = "Hotkeys: [Q/Esc] Quit",
+    control_state_text: str = "DISABLED",
+    help_text: Optional[str] = None,
     anchor_state_text: str = "NOT READY",
+    keyboard_shortcuts: Optional[List[str]] = None,
 ) -> Tuple[int, int, int, int]:
     """
-    Consolidated HUD rendering function (Task 5C-3D-UI-FIX).
-    Delegates to draw_compact_hud to render a single, compact top-left status panel
-    with sharp antialiased text and unobstructed central hand view.
+    Consolidated HUD rendering function (Task 5C-3D-UI-FIX & 5C-3D-HUD-STRUCTURE-STATUS-CLEANUP).
+    Delegates to draw_compact_hud to render a single, structured top-left status panel
+    with sharp antialiased text, consistent alignment, and unobstructed central hand view.
     """
     return draw_compact_hud(
         frame=frame,
@@ -894,6 +1139,7 @@ def draw_mapping_hud(
         help_text=help_text,
         status_heading=status_banner if status_banner else None,
         anchor_state_text=anchor_state_text,
+        keyboard_shortcuts=keyboard_shortcuts,
     )
 
 

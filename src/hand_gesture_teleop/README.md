@@ -27,6 +27,31 @@ source /home/santosh/lerobot_ws/.venv_hand_gesture/bin/activate
 pip install "mediapipe==0.10.35" "numpy<2" "matplotlib>=3.8"
 ```
 
+## Run the Live Simulation Teleoperation (2 Terminals)
+
+Make sure no browser tab or other app is using `/dev/video0`.
+
+**Terminal 1 — Simulated SO-101 Arm, MoveIt 2 & RViz:**
+```bash
+cd /home/santosh/lerobot_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ROS_DOMAIN_ID=10 ros2 launch hand_gesture_teleop so101_sim.launch.py
+```
+
+**Terminal 2 — Hand Gesture Teleoperation & Camera Window:**
+```bash
+cd /home/santosh/lerobot_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ROS_DOMAIN_ID=10 ros2 launch hand_gesture_teleop hand_teleop.launch.py
+```
+
+Controls in the **Hand Gesture Teleop** window (`[E]` Enable/Auto-Anchor, `[D]` Disable/Stop, `[C]` Recalibrate, `[R]` Reset, `[Q/Esc]` Quit).
+Optional overrides: `enable_vertical_z:=true` to enable vertical Z control.
+
+---
+
 ## Run the Phase 1 demo (vision only, no robot)
 
 ```bash
@@ -46,8 +71,14 @@ Size: ~7.5 MB (float16, MediaPipe Hand Landmarker v1)
 
 ```
 hand_gesture_teleop/
-├── hand_gesture_teleop/        # Python module (ROS nodes go here in later phases)
-│   └── __init__.py
+├── hand_gesture_teleop/        # ROS 2 node, tracking, and SO-101 kinematics
+│   ├── __init__.py
+│   ├── hand_teleop_node.py
+│   ├── hand_tracking.py
+│   └── so101_kinematics.py
+├── launch/
+│   ├── hand_teleop.launch.py   # Compact teleoperation launch (.venv_hand_gesture)
+│   └── so101_sim.launch.py     # Mock hardware + MoveIt 2 + RViz 2 launch
 ├── models/
 │   └── hand_landmarker.task    # Official Google MediaPipe model
 ├── resource/
